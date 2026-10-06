@@ -1,0 +1,9 @@
+# CaMML structural-prior adaptation (O'Donnell et al., 2006)
+
+This package is a clean-room Python implementation of the structural-prior mechanisms in *Causal Discovery with Prior Information*. It represents a state as a Totally Ordered Model (TOM), scores the four local pair states and the four global causal-relation states described in the paper, supports full expert-DAG edit priors, and samples TOMs with the proposal mixture used by CaMML. Retained TOMs are aggregated to the project's immutable DAG `Graph` type, yielding both an empirical DAG distribution and its MAP graph.
+
+The complete-discrete `adaptive-mml` backend implements CaMML's adaptive CPT message length: each parent configuration contributes `log((N+r-1)! / ((r-1)! product_i n_i!)) + 0.17649(r-1)`. `bdeu` is an alternative discrete score. `gaussian-bic` is the continuous-data adaptation used by this project; it changes the data/parameter term but not the TOM prior or sampler.
+
+The evidence adapter uses context-compatible provenance representatives and never reads evaluation-only truth or correctness fields. Group-I directed and adjacency claims become local marginals, ancestry and ordering claims become global or temporal marginals, and whole-DAG claims become edit-distance priors. Evidence strength is converted using `p=r/(1+r)` and independent repeated assertions combine in log-odds space. Unsupported MAG, endpoint, and skeleton claims are rejected. Project `ordering` claims are interpreted as the paper's stronger total-order statement and this strengthening is recorded by the contribution type.
+
+This is not a wrapper or complete port of legacy Java CaMML: it does not reproduce MMLEC/SEC grouping, model cleaning, hybrid local models, or the reference annealing schedule. The primary behavioral references were the 2006 paper, Monash technical report 2006/194, and BSD-licensed CaMML revision `842703da4a227cd19a16b2c8675753a709076ee7`.

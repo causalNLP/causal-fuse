@@ -1,0 +1,91 @@
+"""Causal Order + PC/CaMML baselines from Vashishtha et al. (2025)."""
+
+from .api import (
+    fit_camml_with_causal_order,
+    fit_camml_with_llm,
+    fit_pc_with_causal_order,
+    fit_pc_with_llm,
+    query_triplet_order,
+)
+from .integration import (
+    ConstraintIntegration,
+    causal_learn_cpdag,
+    integrate_order_into_cpdag,
+    level_order_from_edges,
+    level_order_prior,
+)
+from .openrouter_backend import (
+    DEFAULT_MODEL,
+    OpenRouterConfig,
+    OpenRouterElicitation,
+    elicit_triplet_order_openrouter,
+    query_pair_fallbacks_openrouter,
+)
+from .local_vllm_backend import (
+    LocalVLLMConfig,
+    LocalVLLMElicitation,
+    LocalVLLMGateError,
+    QWEN35_MODEL,
+    QWEN35_REVISION,
+    QWEN_PAIR_MAX_TOKENS,
+    QWEN_ROLE_ADAPTER,
+    QWEN_TRIPLET_MAX_TOKENS,
+    QWEN_TRIPLET_RETRY_MAX_TOKENS,
+    elicit_triplet_order_local_vllm,
+    query_pair_fallbacks_local_vllm,
+)
+from .types import (
+    CaMMLOrderResult,
+    CausalOrderError,
+    CausalOrderInfeasibleError,
+    PCOrderConfig,
+    PCOrderResult,
+    TripletConfig,
+    TripletExpertResult,
+    UpstreamCausalOrderError,
+)
+from .upstream_backend import (
+    UPSTREAM_REVISION,
+    orient_with_upstream_expert,
+    verified_upstream_root,
+)
+
+__all__ = [
+    "CaMMLOrderResult",
+    "CausalOrderError",
+    "CausalOrderInfeasibleError",
+    "ConstraintIntegration",
+    "DEFAULT_MODEL",
+    "OpenRouterConfig",
+    "OpenRouterElicitation",
+    "LocalVLLMConfig",
+    "LocalVLLMElicitation",
+    "LocalVLLMGateError",
+    "QWEN35_MODEL",
+    "QWEN35_REVISION",
+    "QWEN_PAIR_MAX_TOKENS",
+    "QWEN_ROLE_ADAPTER",
+    "QWEN_TRIPLET_MAX_TOKENS",
+    "QWEN_TRIPLET_RETRY_MAX_TOKENS",
+    "PCOrderConfig",
+    "PCOrderResult",
+    "TripletConfig",
+    "TripletExpertResult",
+    "UPSTREAM_REVISION",
+    "UpstreamCausalOrderError",
+    "causal_learn_cpdag",
+    "elicit_triplet_order_openrouter",
+    "elicit_triplet_order_local_vllm",
+    "fit_camml_with_causal_order",
+    "fit_camml_with_llm",
+    "fit_pc_with_causal_order",
+    "fit_pc_with_llm",
+    "integrate_order_into_cpdag",
+    "level_order_from_edges",
+    "level_order_prior",
+    "orient_with_upstream_expert",
+    "query_triplet_order",
+    "query_pair_fallbacks_openrouter",
+    "query_pair_fallbacks_local_vllm",
+    "verified_upstream_root",
+]

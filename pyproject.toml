@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cd-llm"
+version = "0.1.0"
+description = "Reproducible causal-discovery methods and experiments with expert evidence"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "causal-learn==0.1.4.5",
+  "JPype1>=1.5",
+  "networkx>=3.0",
+  "numpy>=1.26,<2.0",
+  "pandas>=2.2",
+  "py-tetrad @ git+https://github.com/cmu-phil/py-tetrad.git@55de999adbb919ae7b2a39a5c0f5931a044395eb",
+  "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+tetrad = []
+llm-baselines = [
+  "openai==3.3.1",
+]
+full = [
+  "statsmodels>=0.14.0",
+]
+
+[project.scripts]
+cd-llm = "cd_llm.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

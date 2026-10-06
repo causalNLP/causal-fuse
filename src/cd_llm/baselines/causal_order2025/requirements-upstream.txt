@@ -1,0 +1,4 @@
+# Dependencies imported by the pinned authors' triplet/LLM implementation.
+openai==3.3.1
+tqdm>=4.60.0
+matplotlib>=3.7.0

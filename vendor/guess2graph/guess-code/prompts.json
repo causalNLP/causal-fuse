@@ -1,0 +1,30 @@
+{
+  "basic_prompt_v_1": {
+    "description": "Original basic prompt with adjacency matrix generation",
+    "template": "Generate a directed adjacency matrix underlying the causal structure between these variables: {var_names_str}. Create a {matrix_size}x{matrix_size} directed adjacency matrix where:- Rows represent source nodes (what influences)- Columns represent target nodes (what is influenced) - 1 indicates a direct regulatory relationship- 0 indicates no direct relationship- Return ONLY the matrix in this exact format. Here is an example of the format (not the matrix you should return): {example_matrix}. Row i represents the ith variable in this list: {var_names_str}."
+  },
+  "basic_prompt_v_2": {
+    "description": "Basic prompt without example matrix format",
+    "template": "Generate a directed adjacency matrix underlying the causal structure between these variables: {var_names_str}. Create a {matrix_size}x{matrix_size} directed adjacency matrix where:- Rows represent source nodes (what influences)- Columns represent target nodes (what is influenced) - 1 indicates a direct regulatory relationship- 0 indicates no direct relationship- Return ONLY the matrix in this exact format. Row i represents the ith variable in this list: {var_names_str}."
+  },
+  "direct_prompt_v_1": {
+    "description": "Direct prompt that discourages reasoning for GPT-OSS models",
+    "template": "Generate a {matrix_size}x{matrix_size} directed adjacency matrix for causal relationships between: {var_names_str}. NO EXPLANATION. NO REASONING. Return ONLY the matrix as a list of lists with 0s and 1s. Format: {example_matrix}"
+  },
+    "skeleton_prompt_v_1": {
+    "description": "Prompt for identifying causal skeleton as edge pairs",
+    "template": "Identify the causal structure underlying these variables: {var_names_str}. Determine which variables have direct causal relationships between them (ignoring direction). Return your answer as a list of variable name pairs that have direct edges between them. Format your response as pairs of variable names in parentheses, separated by commas. Start your final answer with the tag EDGES: followed by your list."
+  },
+  "skeleton_prompt_v_2": {
+    "description": "Enhanced skeleton prompt with biological context for protein signaling networks",
+    "template": "You are analyzing a protein signaling network. These proteins interact through phosphorylation, activation, and inhibition pathways: {var_names_str}. \n\nIn protein signaling networks, direct causal relationships occur when:\n- One protein directly phosphorylates another\n- One protein directly activates or inhibits another\n- Proteins are part of the same signaling cascade or pathway\n\nIdentify ALL possible direct causal connections between these proteins. Be comprehensive - it's better to include a potential relationship than miss one. Consider both direct biochemical interactions and regulatory relationships. Return your answer as a list of variable name pairs that have direct edges between them. Format your response as pairs of variable names in parentheses, separated by commas. Start your final answer with the tag EDGES: followed by your list."
+  },
+  "skeleton_prompt_v_3": {
+    "description": "Skeleton prompt with examples and recall encouragement",
+    "template": "Identify the causal structure in this protein signaling network: {var_names_str}.\n\nFind ALL direct causal relationships where one protein can directly influence another through:\n- Phosphorylation/dephosphorylation\n- Activation/inhibition\n- Binding interactions\n- Regulatory control\n\nBe thorough and comprehensive. In biological networks, proteins often have multiple interactions. Consider all possible direct connections. Return your answer as a list of variable name pairs that have direct edges between them. Format your response as pairs of variable names in parentheses, separated by commas. Start your final answer with the tag EDGES: followed by your list."
+  },
+  "skeleton_prompt_v_4": {
+    "description": "Step-by-step reasoning prompt for better recall",
+    "template": "Analyze this protein signaling network step by step: {var_names_str}\n\nStep 1: Consider each protein's known biological functions\nStep 2: Identify which proteins can directly interact with each other\nStep 3: Look for signaling pathways and cascades\nStep 4: Include regulatory relationships (activation/inhibition)\n\nFor each pair of proteins, ask: Can protein A directly influence protein B's activity or state?\n\nList ALL direct causal relationships as pairs. Be comprehensive - missing edges is worse than including uncertain ones. Return your answer as a list of variable name pairs that have direct edges between them. Format your response as pairs of variable names in parentheses, separated by commas. Start your final answer with the tag EDGES: followed by your list."
+  }
+}

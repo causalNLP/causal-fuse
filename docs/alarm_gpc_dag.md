@@ -1,0 +1,7 @@
+# ALARM gPC-Guess evaluation
+
+The matched ALARM gPC-Guess evaluation asks Qwen3.5-9B for one directed acyclic expert graph for each observation condition. Generation uses temperature 0.7, reasoning disabled, masked variable identifiers, and the frozen clinical descriptions. Responses that contain unknown variables, self-loops, or directed cycles are invalid; the same prompt is sampled again without editing the graph or substituting another solver. The raw response and every parse attempt remain in the response ledger.
+
+The discovery stage implements gPC-Guess as follows. It starts from the complete undirected graph. The expert DAG's nonedges precede its edges, with each block shuffled. For each edge, the smaller of the two current adjacency sets supplies candidate conditioning variables. At each conditioning-set size, exact d-separation in the expert DAG partitions candidates into predicted separators and all other candidates; the two blocks are shuffled independently and tested in that order. A categorical G-squared conditional-independence test at level 0.05 removes an edge when its p-value exceeds the threshold. There is no conditioning-depth limit, and the result is the final undirected skeleton.
+
+Large conditioning-set permutations and the complete search state are checkpointed transactionally. Reports require all 20 expert DAGs and all 20 prediction conditions; incomplete conditions are not omitted from aggregates. Historical skeleton-only entry points remain available solely to replay experiments that were collected under the earlier protocol.

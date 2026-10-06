@@ -1,0 +1,28 @@
+generated/
+results/
+*.sbatch
+!command/run_mixed_ci_fci_node_count.sbatch
+/sbatch/
+out/
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+*.egg-info/
+.DS_Store
+py-tetrad-env/
+
+# Locally pinned third-party checkout; project adapters live outside this tree.
+/baselines/ECA/
+
+# Vendored external git repositories
+/vendor/ECA/
+/vendor/Causal_Order_Imperfect_Experts/
+/third_party/aci/
+/vendor/sep_distances/*
+!/vendor/sep_distances/README.md
+
+# Codex local files
+.codex*

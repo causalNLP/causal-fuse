@@ -1,0 +1,2 @@
+# Preserve the collaborator's vendored Guess2Graph snapshot byte-for-byte.
+vendor/guess2graph/** -whitespace
