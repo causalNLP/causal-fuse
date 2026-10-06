@@ -306,6 +306,7 @@ def test_scp_amendment_backup_and_restart(tmp_path,monkeypatch):
         archive.add(source,arcname=name)
     source.write_text("after")
     monkeypatch.setattr(baseline,"ROOT",code)
+    monkeypatch.setattr(baseline,"CODE_ROOT",code)
     monkeypatch.setattr(recovery,"queue",lambda:[])
     store=Store(root)
     store.put("scp","0:0:1",dict(trials=[.5]*5))

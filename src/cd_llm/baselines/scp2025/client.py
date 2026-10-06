@@ -184,6 +184,32 @@ class CachedOpenAIJudge:
             probabilities.append(probability)
         return sum(probabilities) / len(probabilities), probabilities
 
+    def cached_usage(self, kind: str, prompt: str) -> dict[str, int]:
+        """Return token usage for one completed logical query."""
+        if kind == "explanation":
+            payloads = [{
+                "kind": kind,
+                "prompt": prompt,
+                "settings": asdict(self.settings),
+            }]
+        elif kind == "yes_probability":
+            payloads = [{
+                "kind": kind,
+                "prompt": prompt,
+                "trial": trial,
+                "settings": asdict(self.settings),
+            } for trial in range(self.settings.probability_samples)]
+        else:
+            raise ValueError(f"unsupported cached query kind: {kind}")
+        records = [self._read_cache(payload) for payload in payloads]
+        if any(record is None for record in records):
+            raise RuntimeError(f"missing completed {kind} cache record")
+        return {
+            "query_count": len(records),
+            "input_tokens": sum(int(record["input_tokens"]) for record in records),
+            "output_tokens": sum(int(record["output_tokens"]) for record in records),
+        }
+
     _LOGPROB_ATTEMPTS = 4
 
     def _sample_logprob_probability(self, prompt: str, trial: int) -> tuple[float, int, int]:

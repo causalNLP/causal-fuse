@@ -29,10 +29,9 @@ from cd_llm.experiments.neuropathic_active_interpretation_report import interval
 from cd_llm.core.finite_support import stable_seed
 from cd_llm.methods.active_query import ClaimQuery, dag_query_pool, query_values
 from cd_llm.metrics.units import metric_metadata
-from cd_llm.paths import WORKSPACE_ROOT as ROOT
+from cd_llm.paths import CODE_ROOT, WORKSPACE_ROOT as ROOT
 
 STUDY = "neuropathic_terra_smc"
-SOURCE = ROOT / "results/20260918T153548Z/neuropathic_confidence_cap"
 MODEL, PROVIDER, CAP, LIMIT = terra.MODEL, terra.PROVIDER, .8, 25.
 BUDGETS = (10, 20, 50, 100)
 METRICS = ("expected_distance", "energy_score", "adjacency_f1", "orientation_f1", "total_tokens")
@@ -59,7 +58,7 @@ def verify(root):
         or m["budgets"] != list(BUDGETS) or m["configuration"]["selection_confidence"] != .9
         or m["configuration"]["soft_confidence_cap"] != .99):
         raise ValueError("registered Terra protocol differs")
-    for collection, base in (("inputs", root), ("implementation", ROOT)):
+    for collection, base in (("inputs", root), ("implementation", CODE_ROOT)):
         for name, digest in m[collection].items():
             if sha256(base / name) != digest:
                 raise ValueError(f"frozen {collection} changed: {name}")
@@ -68,26 +67,26 @@ def verify(root):
     return m
 
 
-def prepare(root):
+def prepare(root, source_root):
     if (root / "manifest.json").exists():
         return verify(root)
-    source, done, audit = (read_json(SOURCE / name) for name in ("manifest.json", "completion.json", "audit.json"))
+    source, done, audit = (read_json(source_root / name) for name in ("manifest.json", "completion.json", "audit.json"))
     if not done["complete"] or not done["audit_passed"] or done["checkpoints"] != 480:
         raise ValueError("Qwen reference incomplete")
-    if sha256(SOURCE / "manifest.json") != done["manifest_sha256"] or sha256(SOURCE / "audit.json") != done["audit_sha256"]:
+    if sha256(source_root / "manifest.json") != done["manifest_sha256"] or sha256(source_root / "audit.json") != done["audit_sha256"]:
         raise ValueError("Qwen provenance differs")
     for name, digest in done["artifacts"].items():
-        if sha256(SOURCE / name) != digest:
+        if sha256(source_root / name) != digest:
             raise ValueError(f"Qwen artifact changed: {name}")
     if source["answer_confidence_cap"] != CAP or source["tasks"] != original.tasks():
         raise ValueError("Qwen settings differ")
     inputs = {}
     def copy(name, target, digest):
-        if sha256(SOURCE / name) != digest:
+        if sha256(source_root / name) != digest:
             raise ValueError(f"Qwen input changed: {name}")
         path = root / target
         path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(SOURCE / name, path)
+        shutil.copyfile(source_root / name, path)
         if sha256(path) != digest:
             raise ValueError("copy hash differs")
         inputs[target] = digest
@@ -95,30 +94,30 @@ def prepare(root):
         if name.startswith(("inputs/", "initializations/", "evaluation/")) or name == "prompts.json":
             copy(name, name, digest)
     for name in ("manifest.json", "completion.json", "audit.json", "summary.csv", "per_run.csv"):
-        copy(name, "reference/" + name, sha256(SOURCE / name))
+        copy(name, "reference/" + name, sha256(source_root / name))
     for task in source["tasks"]:
         name = f"records/{task['id']}.json"
         copy(name, "reference/" + name, audit["records"][task["id"]])
     payload, endpoint = terra.endpoint()
     write_json(root / "provider_endpoints.json", payload)
     inputs["provider_endpoints.json"] = sha256(root / "provider_endpoints.json")
-    # Include all dependencies in the historical SMC implementation fingerprint.
+    # Include all dependencies in the source SMC implementation fingerprint.
     names = set(source["implementation"])
-    names.update(("code/src/cd_llm/experiments/neuropathic_terra_smc.py",
-                  "code/src/cd_llm/experiments/neuropathic_causal_order_terra.py",
-                  "code/tests/unit/experiments/test_neuropathic_terra_smc.py",
-                  "sbatch/neuropathic_terra_smc.sbatch"))
+    names.update((
+        str(Path(__file__).resolve().relative_to(CODE_ROOT.resolve())),
+        str(Path(terra.__file__).resolve().relative_to(CODE_ROOT.resolve())),
+    ))
     dated = endpoint.get("name", "").split(" | ")[-1]
     if not dated.startswith(MODEL):
         raise ValueError("endpoint does not identify a Terra model revision")
     config = dict(source["configuration"], model=MODEL, comparison="terra_minus_qwen_matched_cap08")
     config.pop("api_requests", None)
-    write_json(root / "manifest.json", dict(study=STUDY, version=1, source=str(SOURCE), tasks=tasks(),
+    write_json(root / "manifest.json", dict(study=STUDY, version=2, source=str(source_root), tasks=tasks(),
         settings=settings(), model=MODEL, provider=PROVIDER, response_provider="OpenAI",
         response_models=sorted({MODEL, dated}), pricing=endpoint["pricing"], cost_limit_usd=LIMIT,
         answer_confidence_cap=CAP, budgets=list(BUDGETS), configuration=config,
         expected_outcomes=1900, nominal_responses=8550, concurrency=4, inputs=inputs,
-        implementation={name:sha256(ROOT / name) for name in sorted(names)}))
+        implementation={name:sha256(CODE_ROOT / name) for name in sorted(names)}))
     write_json(root / "status.json", dict(stage="prepared", expected_outcomes=1900, expected_trajectories=120))
     return verify(root)
 
@@ -506,8 +505,10 @@ def main(argv=None):
     parser.add_argument("--run-id",required=True)
     parser.add_argument("--block",type=int)
     parser.add_argument("--chain",action="store_true")
+    parser.add_argument("--source-root",type=Path)
     args = parser.parse_args(argv)
     root = ROOT / "results" / run_id(args.run_id) / STUDY
+    source_root = args.source_root or root.parent / capped.STUDY
     root.mkdir(parents=True,exist_ok=True)
     terra._STOP = False
     signal.signal(signal.SIGUSR1,lambda *_: setattr(terra,"_STOP",True))
@@ -524,7 +525,7 @@ def main(argv=None):
         with (root / "workflow.lock").open("a") as lock:
             fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.stage=="prepare":
-                prepare(root)
+                prepare(root,source_root)
             elif args.stage=="collect":
                 asyncio.run(collect(root))
                 audit_cache(root)

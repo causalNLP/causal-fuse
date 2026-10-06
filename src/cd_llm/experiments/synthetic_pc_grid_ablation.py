@@ -1,4 +1,4 @@
-"""Matched soft-expert acquisition study from archived data-only PC grids."""
+"""Matched soft-expert acquisition study from packaged data-only PC grids."""
 
 from __future__ import annotations
 
@@ -21,12 +21,12 @@ from cd_llm.experiments.claim_fuse_smc_eig import (
 from cd_llm.experiments.common.artifacts import (
     read_json, run_id, sha256, write_csv, write_json, write_text,
 )
+from cd_llm.experiments.common.reproduction_inputs import materialize, protocol
 from cd_llm.methods.active_query import QueryResponse, active_query_smc, dag_query_pool, query_values
 from cd_llm.methods.adaptive_pruning import GaussianBICScore
 from cd_llm.paths import WORKSPACE_ROOT
 
 STUDY = "synthetic_pc_grid_ablation"
-SOURCE_RUN = "20260816T145618Z"
 SCMS = (1, 2, 7, 12, 15, 34, 36, 40, 45, 47)
 SIZES = (200, 1000)
 ACCURACIES = (0.6, 0.8, 1.0)
@@ -65,7 +65,7 @@ def code_hashes():
 
 
 def pc_grid_distribution(payload, n):
-    """Read *pre-evidence* probabilities, never the archived fused posterior."""
+    """Read pre-evidence probabilities without loading a fused posterior."""
     protocol = payload["protocol"]
     if protocol["node_count"] != 20 or protocol["pc_alphas"] != SETTINGS["pc_alphas"]:
         raise ValueError("source is not the locked 20-node, three-alpha PC grid")
@@ -96,46 +96,32 @@ def check_manifest(root):
     return manifest
 
 
-def prepare(root, results_root):
+def prepare(root):
     if (root / "manifest.json").exists():
         return check_manifest(root)
     root.mkdir(parents=True, exist_ok=True)
-    inputs, sources = {}, {}
-    for g in SCMS:
-        source = results_root / SOURCE_RUN / "partials" / f"task_{g:03d}.json"
-        payload = read_json(source)
-        if payload["graph_index"] != g:
-            raise ValueError("source SCM mismatch")
-        sources[str(g)] = dict(path=str(source.resolve()), sha256=sha256(source), seeds=payload["seeds"])
-        for n in SIZES:
-            data = np.asarray(payload["nested_data"][str(n)], dtype=float)
-            if data.shape != (n, 20) or not np.isfinite(data).all():
-                raise ValueError("source data shape or values differ")
-            distribution = pc_grid_distribution(payload, n)
-            score = GaussianBICScore(data, standardize_data=True, max_parents=12)
-            for graph in distribution:
-                score.parent_masks(graph)
-            init_seed = stable_seed(STUDY, "initialization", g, n)
-            particles, weights, empirical = _initial_particle_population(distribution, init_seed)
-            truth = _graph(payload["target"], 20)
-            key = f"s{g:02d}_n{n}"
-            target = root / "inputs" / f"{key}.json"
-            write_json(target, dict(
-                graph_index=g, sample_size=n, data_seed=payload["seeds"]["data_seed"],
-                initialization_seed=init_seed, data=data.tolist(), truth=payload["target"],
-                source_sha256=sources[str(g)]["sha256"],
-                raw_data_distribution=_serialize(distribution),
-                particles=[_serialize({graph: 1.0})[0]["graph"] for graph in particles],
-                weights=weights.tolist(), initialization=_serialize(empirical),
-                baseline={k: v for k, v in _metrics(empirical, truth).items() if math.isfinite(v)},
-            ))
-            inputs[key] = sha256(target)
+    extracted = materialize("synthetic", root)
+    inputs = {}
+    for g, n in product(SCMS, SIZES):
+        key = f"s{g:02d}_n{n}"
+        target = root / "inputs" / f"{key}.json"
+        payload = read_json(target)
+        if payload["graph_index"] != g or payload["sample_size"] != n:
+            raise ValueError("packaged synthetic input identity differs")
+        data = np.asarray(payload["data"], dtype=float)
+        if data.shape != (n, 20) or not np.isfinite(data).all():
+            raise ValueError("packaged synthetic data shape or values differ")
+        particles = tuple(_graph(item, 20) for item in payload["particles"])
+        weights = np.asarray(payload["weights"], dtype=float)
+        if len(particles) != len(weights) or not np.isclose(weights.sum(), 1):
+            raise ValueError("packaged synthetic initialization differs")
+        inputs[key] = extracted[f"inputs/{key}.json"]
     code_root = Path(__file__).resolve().parents[3]
     commit = subprocess.check_output(["git", "-C", str(code_root), "rev-parse", "HEAD"], text=True).strip()
-    manifest = dict(study=STUDY, version=1, source_run=SOURCE_RUN, settings=SETTINGS,
-                    tasks=tasks(), budgets=BUDGETS, sources=sources, inputs=inputs,
+    manifest = dict(study=STUDY, version=2, input_bundle=protocol()["bundles"]["synthetic"],
+                    settings=SETTINGS, tasks=tasks(), budgets=BUDGETS, inputs=inputs,
                     code_hashes=code_hashes(), code_commit=commit,
-                    interpretation="Accuracy and confidence vary together; ten existing common-complete SCM/data pairs.")
+                    interpretation="Accuracy and confidence vary together; ten fixed common-complete SCM/data pairs.")
     write_json(root / "manifest.json", manifest, exclusive=True)
     return manifest
 
@@ -322,7 +308,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     root = args.results_root / run_id(args.run_id) / STUDY
     if args.stage == "prepare":
-        prepare(root, args.results_root)
+        prepare(root)
     elif args.stage == "aggregate":
         aggregate(root)
     else:

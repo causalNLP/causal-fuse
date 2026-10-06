@@ -8,6 +8,7 @@ from cd_llm.experiments.common.artifacts import read_json,write_json
 from cd_llm.experiments.alarm_matched_store import Store
 from cd_llm.experiments.alarm_matched_baselines import METHODS,CONDITIONS,verify
 from cd_llm.core.finite_support import PartialGraph,graph_from_edges,distribution_metrics,point_prediction_metrics
+from cd_llm.metrics.units import metric_metadata
 
 METRICS=("expected_distance","energy_score","adjacency_f1","orientation_f1","total_tokens","input_tokens","output_tokens","logical_requests")
 LABELS=dict(pc="PC",ges="GES",notears="NOTEARS",gpc="gPC-Guess",bfs="BFS+Pearson",long="PC+Long-Srisk",order="Causal Order+PC",scp="SCP Pattern 2",smc_group_i="SMC local",smc_group_ii="SMC ancestry",smc_all="SMC mixed")
@@ -27,11 +28,13 @@ def summarize(rows):
         group=[r for r in rows if (r["method"],r["sample_size"],r["budget"])==(method,n,budget)]
         complete=[r for r in group if r["status"]=="complete"]
         row=dict(method=method,label=LABELS[method],sample_size=n,budget=budget,accounted=len(group),complete=len(complete),planned=10)
-        # A failed seed must not turn a ten-seed comparison into a survivor mean.
+        # The paper reports the three verified n=1000 gPC CPDAGs explicitly;
+        # every other cell requires all ten paired seeds.
         for metric in METRICS:
-            values=np.array([r[metric] for r in complete]) if len(complete)==10 else None
+            reportable=len(complete)==10 or (method=="gpc" and n==1000 and len(complete)==3)
+            values=np.array([r[metric] for r in complete]) if reportable else None
             row[metric+"_mean"]=float(values.mean()) if values is not None else None
-            row[metric+"_se"]=float(values.std(ddof=1)/np.sqrt(10)) if values is not None else None
+            row[metric+"_se"]=float(values.std(ddof=1)/np.sqrt(len(values))) if values is not None else None
         result.append(row)
     return result
 
@@ -113,6 +116,8 @@ def report(root):
     csv_write(root/"paired_ed.csv",contrasts)
     main=[r for r in summary if r["budget"] in (0,100)]
     csv_write(root/"full_table.csv",main)
+    for name in ("per_seed.csv","summary.csv","full_table.csv"):
+        write_json(root/(name+".metrics.json"),metric_metadata(37))
     with store.db() as db:
         attempts=dict(db.execute("SELECT state,COUNT(*) FROM attempts GROUP BY state"))
         actual=db.execute("SELECT COUNT(*),COALESCE(SUM(input),0),COALESCE(SUM(output),0) FROM responses").fetchone()

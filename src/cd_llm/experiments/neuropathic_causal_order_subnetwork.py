@@ -64,11 +64,13 @@ from cd_llm.experiments.neuropathic_benchmark import (
 )
 from cd_llm.experiments.neuropathic_panel_point_benchmark import run_pc
 from cd_llm.experiments.neuropathic_runtime import run_ges
+from cd_llm.metrics.units import metric_metadata
 from cd_llm.paths import CODE_ROOT, WORKSPACE_ROOT
 
 
 STUDY = "neuropathic_causal_order_subnetwork"
 STUDY_VERSION = 1
+DATA_SEEDS = tuple(range(10))
 # The baseline implementation fingerprint is pinned for this run because the
 # only post-launch change is retrying transient filesystem reads; PC, GES, the
 # data, and every numerical setting are unchanged.
@@ -133,7 +135,8 @@ class SubnetworkSpec:
 
 def slice_for_task(task_index: int) -> tuple[int, int]:
     if not 0 <= task_index < len(DATA_SEEDS) * len(SAMPLE_SIZES):
-        raise ValueError("task index must lie in [0, 39]")
+        raise ValueError(
+            f"task index must lie in [0, {len(DATA_SEEDS) * len(SAMPLE_SIZES) - 1}]")
     seed, size_index = divmod(task_index, len(SAMPLE_SIZES))
     return DATA_SEEDS[seed], SAMPLE_SIZES[size_index]
 
@@ -391,37 +394,22 @@ def _retry_io(
 
 
 def _load_data(
-    results_root: Path,
+    data_root: Path,
     spec: SubnetworkSpec,
     seed: int,
     sample_size: int,
 ) -> tuple[np.ndarray, Path, str, Path, str, int]:
-    reference_path = _reference_path(results_root, seed)
-    reference, reference_read_attempts = _retry_io(lambda: read_json(reference_path))
-    if reference.get("run_id") != REFERENCE_RUN_ID or reference.get("data_seed") != seed:
-        raise ValueError("frozen Panel-A reference identity differs")
-    if tuple(reference["panel"]["node_names"])[0:SUBNETWORK_NODE_COUNT] != spec.node_names:
-        raise ValueError("frozen Panel-A semantic node order differs")
-    sample = reference["sample_artifacts"][str(sample_size)]
-    data_path = Path(sample["data_path"])
-    data_hash = str(sample["data_sha256"])
-    def read_verified_frame() -> pd.DataFrame:
-        if sha256(data_path) != data_hash:
-            raise ValueError("frozen Panel-A data hash differs")
-        return pd.read_csv(data_path, index_col=0)
-
-    frame, data_read_attempts = _retry_io(read_verified_frame)
-    selected_columns = tuple(str(index) for index in spec.original_indices)
-    if any(column not in frame for column in selected_columns):
-        raise ValueError("subnetwork columns are absent from the frozen Panel-A data")
-    data = frame.loc[:, list(selected_columns)].to_numpy(dtype=np.int64, copy=True)
+    data_path = data_root / f"neuropathic_s{seed:02d}_n{sample_size}.npy"
+    data, data_read_attempts = _retry_io(
+        lambda: np.load(data_path, allow_pickle=False).astype(np.int64, copy=True)
+    )
+    data_hash = sha256(data_path)
     if data.shape != (sample_size, SUBNETWORK_NODE_COUNT):
         raise ValueError("subnetwork data shape differs")
     if np.any((data != 0) & (data != 1)):
         raise ValueError("subnetwork observations must be raw binary integers")
-    reference_hash, reference_hash_attempts = _retry_io(lambda: sha256(reference_path))
-    total_attempts = reference_read_attempts + data_read_attempts + reference_hash_attempts
-    return data, data_path, data_hash, reference_path, reference_hash, total_attempts
+    total_attempts = data_read_attempts
+    return data, data_path, data_hash, data_path, data_hash, total_attempts
 
 
 def compute_baseline_slice(
@@ -430,6 +418,7 @@ def compute_baseline_slice(
     output_run: str,
     results_root: Path,
     model_path: Path,
+    data_root: Path,
     *,
     pc_runner: Callable[..., Any] | None = None,
     ges_runner: Callable[..., Any] | None = None,
@@ -440,7 +429,7 @@ def compute_baseline_slice(
         raise ValueError("invalid neuropathic benchmark slice")
     spec = build_subnetwork_spec(model_path)
     data, data_path, data_hash, reference_path, reference_hash, data_io_attempts = _load_data(
-        results_root, spec, seed, sample_size
+        data_root, spec, seed, sample_size
     )
     protocol = _protocol()
 
@@ -988,6 +977,8 @@ def aggregate(output_run: str, results_root: Path, model_path: Path) -> Path:
     }
     write_csv(root / "raw_results.csv", raw_rows)
     write_csv(root / "summary.csv", summary)
+    write_json(root / "raw_results.csv.metrics.json", metric_metadata(20))
+    write_json(root / "summary.csv.metrics.json", metric_metadata(20))
     write_json(root / "token_summary.json", token_summary)
     write_json(
         root / "run_manifest.json",
@@ -1023,12 +1014,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--data-root", type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     output_run = run_id(arguments.run_id)
+    data_root = arguments.data_root or arguments.results_root / output_run / "neuropathic_new_prompt_smc" / "inputs"
     if arguments.stage == "prepare-manifest":
         if arguments.image_path is None or arguments.checkpoint_path is None:
             raise ValueError("image and checkpoint paths are required")
@@ -1038,7 +1031,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--task-index is required for baseline computation")
         seed, sample_size = slice_for_task(arguments.task_index)
         compute_baseline_slice(
-            seed, sample_size, output_run, arguments.results_root, arguments.model_path
+            seed, sample_size, output_run, arguments.results_root, arguments.model_path, data_root
         )
     elif arguments.stage == "qwen":
         if arguments.runtime_manifest is None:

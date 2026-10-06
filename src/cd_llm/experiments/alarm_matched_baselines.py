@@ -1,8 +1,8 @@
 """Matched ALARM baselines with native confidence and exhaustive acquisition."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
-from dataclasses import asdict
 import argparse
+from dataclasses import asdict
 import io
 from itertools import combinations
 import json
@@ -19,12 +19,11 @@ from cd_llm.experiments.common.artifacts import read_json,write_json,sha256
 from cd_llm.experiments.alarm_matched_store import Store,Transport,Checkpoint,MODEL,digest
 from cd_llm.experiments import alarm_matched_methods as methods
 from cd_llm.experiments import alarm_observational as observational
+from cd_llm.experiments.common import categorical_grid as grid
 from cd_llm.core.finite_support import PartialGraph,graph_edges
-from cd_llm.paths import WORKSPACE_ROOT
+from cd_llm.paths import CODE_ROOT, WORKSPACE_ROOT
 
 ROOT=WORKSPACE_ROOT
-SOURCE=ROOT/"results/20260920T164354Z/alarm_claim_pools_local"
-GRID=ROOT/"results/20260920T150549Z/alarm_claim_pools"
 METHODS=("pc","ges","notears","gpc","bfs","long","order","scp")
 CONDITIONS=[(s,n) for s in range(1000,1010) for n in (200,1000)]
 
@@ -50,47 +49,38 @@ def verify(root):
     for name,value in m["inputs"].items():
         if sha256(root/name)!=value: raise ValueError(f"frozen input changed: {name}")
     for name,value in m["implementation"].items():
-        if sha256(ROOT/name)!=value: raise ValueError(f"frozen code changed: {name}")
+        if sha256(CODE_ROOT/name)!=value: raise ValueError(f"frozen code changed: {name}")
     return m
 
 
-def prepare(root):
+def prepare(root, source_root):
     if (root/"manifest.json").exists(): return verify(root)
     from cd_llm.experiments.alarm_claim_pools_local import verify as verify_source
-    source=verify_source(SOURCE)
-    completion=read_json(SOURCE/"completion.json")
+    source=verify_source(source_root)
+    completion=read_json(source_root/"completion.json")
     if not completion["complete"] or completion["trajectories"]!=60 or completion["checkpoints"]!=240:
         raise ValueError("source SMC experiment incomplete")
-    if completion["manifest_sha256"]!=sha256(SOURCE/"manifest.json"): raise ValueError("source manifest mismatch")
+    if completion["manifest_sha256"]!=sha256(source_root/"manifest.json"): raise ValueError("source manifest mismatch")
     for name,value in completion["artifacts"].items():
-        if sha256(SOURCE/name)!=value: raise ValueError(f"source result changed: {name}")
+        if sha256(source_root/name)!=value: raise ValueError(f"source result changed: {name}")
     root.mkdir(parents=True,exist_ok=True)
     for folder in ("inputs","evaluation","smc","status"):
         (root/folder).mkdir(exist_ok=True)
     files=[c["data_path"] for c in source["conditions"]]+["inputs/model_metadata.json","inputs/encoding.json","inputs/presentation.json","inputs/runtime.json","evaluation/truth_graph.json"]
-    for name in files: shutil.copyfile(SOURCE/name,root/name)
+    for name in files: shutil.copyfile(source_root/name,root/name)
     for name in ("manifest.json","completion.json","per_run.csv","summary.csv"):
-        shutil.copyfile(SOURCE/name,root/"smc"/name)
+        shutil.copyfile(source_root/name,root/"smc"/name)
     fits={}
-    grid_manifest=read_json(GRID/"manifest.json")
     for i,(seed,n) in enumerate(CONDITIONS):
         data=np.load(root/f"inputs/{cid(i)}.npy",allow_pickle=False)
         if data.shape!=(n,37): raise ValueError("invalid observation shape")
         if n==200 and not np.array_equal(data,np.load(root/f"inputs/alarm_s{seed}_n1000.npy")[:200]):
             raise ValueError("observations are not paired/nested")
-        if sha256(GRID/f"inputs/{cid(i)}.npy")!=sha256(root/f"inputs/{cid(i)}.npy"):
-            raise ValueError("statistical fit data mismatch")
         fits[cid(i)]={}
-        for method,config in (("pc","pc_a0.05"),("ges","ges_e1_p1")):
-            path=GRID/f"fits/{cid(i)}_{config}.json"
-            fit=read_json(path)
-            if fit["manifest_sha256"]!=sha256(GRID/"manifest.json"): raise ValueError("fit manifest mismatch")
-            expected=next(x for x in grid_manifest["configuration"]["grid"] if x["id"]==config)
-            if fit["config"]!=expected: raise ValueError("fit configuration mismatch")
-            locked={"pc":dict(alpha=.05,family="pc",id="pc_a0.05"),
-                "ges":dict(equivalent_sample_size=1.,structure_prior=1.,family="ges",id="ges_e1_p1")}[method]
-            if fit["config"]!=locked: raise ValueError(f"unexpected fit configuration: {fit['config']}")
-            fits[cid(i)][method]=dict(partial=fit["partial"],config=fit["config"],source=str(path),sha256=sha256(path))
+        for method,locked in (("pc",dict(alpha=.05,family="pc",id="pc_a0.05")),
+                ("ges",dict(equivalent_sample_size=1.,structure_prior=1.,family="ges",id="ges_e1_p1"))):
+            partial=grid.fit_partial(data,locked)
+            fits[cid(i)][method]=dict(partial=asdict(partial),config=locked,source="fresh-data-only-fit")
     write_json(root/"inputs/statistics.json",fits)
     names,descriptions,context=metadata(root)
     prompts=methods.order_prompts(names,descriptions,context)
@@ -105,14 +95,11 @@ def prepare(root):
     write_json(root/"inputs/prompts.json",prompts)
     sources=set(Path(__file__).parent.glob("alarm_matched_*.py"))
     sources.update(Path(__file__).parent/p for p in ("alarm_local_support.py","alarm_llm_recovery.py","alarm_llm_repair.py","alarm_observational.py","alarm_bfs_openrouter.py","causal_order2025_table42.py"))
-    for folder in ("code/src/cd_llm/baselines","code/src/cd_llm/core","code/src/cd_llm/methods","code/vendor/Causal_Order_Imperfect_Experts/causal_discovery"):
-        sources.update((ROOT/folder).rglob("*.py"))
-    sources.update((ROOT/"code/figures").glob("alarm_matched_*.py"))
-    sources.update((ROOT/"sbatch").glob("alarm_matched_*.sbatch"))
-    sources.add(ROOT/"code/tests/unit/experiments/test_alarm_matched_baselines.py")
-    if len(list((SOURCE/"records").glob("*.json")))!=60: raise ValueError("expected sixty frozen SMC trajectories")
-    write_json(root/"manifest.json",dict(source=str(SOURCE),source_manifest_sha256=sha256(SOURCE/"manifest.json"),
-        smc_trajectories={str(p.relative_to(SOURCE)):sha256(p) for p in (SOURCE/"records").glob("*.json")},
+    for folder in ("src/cd_llm/baselines","src/cd_llm/core","src/cd_llm/methods"):
+        sources.update((CODE_ROOT/folder).rglob("*.py"))
+    if len(list((source_root/"records").glob("*.json")))!=60: raise ValueError("expected sixty fresh SMC trajectories")
+    write_json(root/"manifest.json",dict(source=str(source_root),source_manifest_sha256=sha256(source_root/"manifest.json"),
+        smc_trajectories={str(p.relative_to(source_root)):sha256(p) for p in (source_root/"records").glob("*.json")},
         model=MODEL,runtime=source["runtime"],runtime_fingerprint=source["runtime_fingerprint"],
         methods=METHODS,conditions=CONDITIONS,baseline_confidence_cap=None,smc_confidence_cap=.8,
         settings=dict(observational=observational.SETTINGS,gpc=dict(alpha=.05,trial_seed=0,max_depth=None),
@@ -120,7 +107,7 @@ def prepare(root):
             scp=dict(bootstraps=100,probability_trials=5,forbid=.05,require=.95,temperature=.7),temperature=0,seed=0,thinking=False),
         input_column_order="already presented; no additional permutation",baseline_evaluations=160,
         inputs={str(p.relative_to(root)):sha256(p) for folder in ("inputs","evaluation","smc") for p in (root/folder).glob("*")},
-        implementation={str(p.resolve().relative_to(ROOT.resolve())):sha256(p) for p in sources},actual_api_spending_usd=0))
+        implementation={str(p.resolve().relative_to(CODE_ROOT.resolve())):sha256(p) for p in sources},actual_api_spending_usd=0))
     Store(root)
     write_json(root/"status.json",dict(stage="prepared",baseline_evaluations=160,scp_pairs=26640,order_triplets=7770))
     return verify(root)
@@ -524,7 +511,7 @@ def _submit(root,stage,array=None,dependency=None,condition=None,token=None):
     return job
 
 
-def main():
+def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("stage",choices=("prepare","recover","resume","bootstrap","pilot","collect","collect-order-fallbacks","audit","fit","gpc","report","submit","amend-scp-temperature","amend-order-threshold","amend-order-cycle-guard"))
     p.add_argument("--root",type=Path,required=True)
@@ -535,8 +522,9 @@ def main():
     p.add_argument("--shard",type=int,default=0)
     p.add_argument("--shards",type=int,default=1)
     p.add_argument("--chain",action="store_true")
-    args=p.parse_args()
+    args=p.parse_args(argv)
     root=args.root
+    source_root=args.source_root or root.parent/"alarm_claim_pools_local"
     deadline=float(os.environ.get("ALARM_MATCHED_DEADLINE","inf"))
     try:
         if args.stage=="amend-order-cycle-guard":
@@ -566,7 +554,7 @@ def main():
             else: resume(root)
             return
         if args.stage=="prepare":
-            prepare(root)
+            prepare(root,source_root)
             if args.chain:
                 job=submit(root,"bootstrap",array="0-19%4",dependency="afterok:"+os.environ["SLURM_JOB_ID"])
                 submit(root,"collect",dependency="afterok:"+job)

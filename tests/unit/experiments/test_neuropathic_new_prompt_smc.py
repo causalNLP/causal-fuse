@@ -87,7 +87,11 @@ class NewPromptTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("reverse causation", text)
                 if kind == "directed":
                     self.assertIn("directly causes", text)
-        self.assertEqual(len(cache.tasks()), 1140)
+        self.assertEqual(len(cache.tasks()), 1900)
+        self.assertEqual(
+            {query.kind for query, _strategy in cache.tasks()},
+            {"directed", "adjacency", "ancestry"},
+        )
         self.assertEqual(len(queries), 950)
         self.assertEqual(len(cache.original.tasks()), 120)
 

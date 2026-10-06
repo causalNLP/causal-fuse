@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "alarm_inputs.tar.gz": "e1e56721af282b325698d8eca45527edb7cb6558552bbbae9d38e69fa621e89f",
+    "neuropathic_benchmark.zip": "72958628514db8c9377db45f40f447ee60ee30d56d03f850cf3d3ab51dbaac15",
+    "neuropathic_inputs.tar.gz": "942445287c41760af4ca4dc03df098c17cb1b36e0923c9d684ba89b53c7d40e9",
+    "synthetic_inputs.tar.gz": "246735bff6fa9a72f9df716c23b87fbcce49e443611ddacadf3731e6ec0b3750"
+  },
+  "bundles": {
+    "alarm": "alarm_inputs.tar.gz",
+    "neuropathic": "neuropathic_inputs.tar.gz",
+    "synthetic": "synthetic_inputs.tar.gz"
+  },
+  "datasets": {
+    "alarm": {
+      "sample_sizes": [200, 1000],
+      "seeds": [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009]
+    },
+    "neuropathic": {
+      "sample_sizes": [200, 1000],
+      "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    },
+    "synthetic": {
+      "graph_seeds": [1, 2, 7, 12, 15, 34, 36, 40, 45, 47],
+      "sample_sizes": [200, 1000]
+    }
+  },
+  "hosted_models": {
+    "qwen": {
+      "max_tokens": 256,
+      "model": "qwen/qwen3.5-9b",
+      "provider": "deepinfra/bf16",
+      "reasoning": false,
+      "seed": 0,
+      "temperature": 0.0
+    },
+    "terra": {
+      "max_tokens": 256,
+      "model": "openai/gpt-5.6-terra",
+      "provider": "openai",
+      "reasoning": false,
+      "seed": 0,
+      "temperature": 0.0
+    }
+  },
+  "local_model": {
+    "dtype": "bfloat16",
+    "gpu_memory_utilization": 0.85,
+    "max_model_len": 32768,
+    "max_num_seqs": 4,
+    "model": "Qwen/Qwen3.5-9B",
+    "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "served_model_name": "Qwen/Qwen3.5-9B",
+    "vllm_version": "0.26.1rc1.dev1133+gf94666b60"
+  },
+  "version": 1
+}

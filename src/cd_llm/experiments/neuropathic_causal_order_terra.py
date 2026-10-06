@@ -1,4 +1,4 @@
-"""Frozen Table 2 Causal Order+PC experiment with audited Terra elicitation."""
+"""Table 2 Causal Order+PC experiment with audited Terra elicitation."""
 from __future__ import annotations
 
 import argparse
@@ -24,14 +24,15 @@ import time
 from unittest.mock import patch
 import urllib.request
 
+import numpy as np
+
 from cd_llm.experiments.common.artifacts import (
     json_value, read_json, run_id, sha256, write_csv, write_json, write_text,
 )
-from cd_llm.paths import WORKSPACE_ROOT as ROOT
+from cd_llm.experiments.common.reproduction_inputs import materialize, protocol
+from cd_llm.paths import CODE_ROOT, WORKSPACE_ROOT as ROOT
 
 STUDY = "neuropathic_causal_order_terra"
-SOURCE = ROOT / "results/20260903T022032Z/neuropathic_decontamination_qwen"
-TERRA_SOURCE = ROOT / "results/20260903T011254Z/neuropathic_decontamination"
 MODEL = "openai/gpt-5.6-terra"
 PROVIDER = "openai"
 LIMIT = 25.0
@@ -68,7 +69,7 @@ def answer_tags(content):
 
 
 def graph_answer(content):
-    """Match the archived graph parser, including isolated-node entries."""
+    """Match the registered graph parser, including isolated-node entries."""
     for tag in reversed(answer_tags(content)):
         try:
             values = ast.literal_eval(tag.strip())
@@ -170,7 +171,7 @@ def verify(root):
         if sha256(root / name) != digest:
             raise ValueError(f"frozen input changed: {name}")
     for name, digest in manifest["implementation"].items():
-        if sha256(ROOT / name) != digest:
+        if sha256(CODE_ROOT / name) != digest:
             raise ValueError(f"frozen implementation changed: {name}")
     return manifest
 
@@ -180,106 +181,76 @@ def prepare(root):
         verify(root)
         return
     from cd_llm.experiments.neuropathic_decontamination import build_spec, audit_model_text
-    from cd_llm.core.finite_support import graph_edges
     from cd_llm.baselines.causal_order2025.upstream_backend import UPSTREAM_REVISION
     import pandas as pd
 
-    inputs, provenance = {}, {}
+    inputs = {}
 
     def save(name, value):
         write_json(root / name, value)
         inputs[name] = sha256(root / name)
 
-    def copy(source, name, expected=None):
+    def copy(source, name):
         digest = sha256(source)
-        if expected is not None and digest != expected:
-            raise ValueError(f"source hash differs: {source}")
         destination = root / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
         if sha256(destination) != digest:
             raise ValueError("snapshot hash differs")
         inputs[name] = digest
-        provenance[name] = dict(path=str(source), sha256=digest)
-
-    original = read_json(SOURCE / "benchmark/evaluation_manifest.json")
-    copy(SOURCE / "benchmark/evaluation_manifest.json", "reference/qwen_manifest.json")
-    benchmark = original["source_benchmark_manifest"]
-    copy(Path(benchmark["path"]), "reference/benchmark_manifest.json", benchmark["sha256"])
-    metadata_path = Path(benchmark["path"]).parent / "model_metadata.json"
-    copy(metadata_path, "inputs/model_metadata.json")
-    metadata = read_json(metadata_path)
+    packaged = root / "packaged"
+    materialize("neuropathic", packaged)
+    copy(packaged / "inputs/model_metadata.json", "inputs/model_metadata.json")
+    metadata = read_json(root / "inputs/model_metadata.json")
     if tuple(n["id"] for n in metadata["nodes"]) != NAMES:
         raise ValueError("opaque variable order differs")
     spec = build_spec()
     if metadata["nodes"] != [dict(id=n, description=spec.descriptions[n]) for n in NAMES]:
         raise ValueError("clinical descriptions differ")
-    save("evaluation/truth.json", graph_edges(spec.target))
-    for category, folder in (("datasets", "data"), ("source_statistics", "statistics")):
-        if sorted((e["seed"], e["sample_size"]) for e in original[category]) != list(CONDITIONS):
-            raise ValueError("Table 2 conditions differ")
-        for entry in original[category]:
-            extension = "csv" if category == "datasets" else "json"
-            name = f"inputs/{folder}/seed_{entry['seed']:02d}_n{entry['sample_size']}.{extension}"
-            copy(Path(entry["path"]), name, entry["sha256"])
+    truth = read_json(packaged / "evaluation/truth_graph.json")["graph"]
+    save("evaluation/truth.json", truth)
+    for seed, sample_size in CONDITIONS:
+        data = np.load(packaged / f"inputs/neuropathic_s{seed:02d}_n{sample_size}.npy", allow_pickle=False)
+        frame = pd.DataFrame(data, columns=NAMES)
+        path = root / f"inputs/data/seed_{seed:02d}_n{sample_size}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(path, index=False)
+        inputs[str(path.relative_to(root))] = sha256(path)
+        copy(packaged / f"inputs/statistics/seed_{seed:02d}_n{sample_size}.json",
+             f"inputs/statistics/seed_{seed:02d}_n{sample_size}.json")
     for seed in range(10):
         small = pd.read_csv(root / f"inputs/data/seed_{seed:02d}_n200.csv")
         large = pd.read_csv(root / f"inputs/data/seed_{seed:02d}_n1000.csv")
         if tuple(small.columns) != NAMES or not small.equals(large.iloc[:200].reset_index(drop=True)):
             raise ValueError("nested observations differ")
 
-    rows = snapshot_rows(SOURCE / "caches/causal_order.sqlite3")
-    save("reference/qwen_responses.json", rows)
-    copy(SOURCE / "shared/causal_order_expert.json", "reference/qwen_expert.json")
     context = "to model " + metadata["domain_context"] + ". Variable metadata: " + "; ".join(
         f"{n['id']} means {n['description']}" for n in metadata["nodes"])
     mod = modules()
-    triples = {fingerprint(chat_messages(mod.triplet.generate_subgraph_prompt(list(g), context))): g for g in TRIPLETS}
-    pairs = {fingerprint(chat_messages(mod.triplet.cot_tiebreaker_prompt(a, b, list(NAMES), context))): (a, b)
-             for a, b in PAIRS}
-    archived = {}
-    for row in rows:
-        request = json.loads(row["request_json"])
-        messages = request["messages"]
-        signature = fingerprint(messages)
-        allowed = triples if row["purpose"].startswith("triplet") else pairs
-        if signature not in allowed:
-            raise ValueError("saved Table 2 prompt does not match its reconstructed template")
-        audit_model_text("\n".join(m["content"] for m in messages), spec)
-        if row["purpose"] == "triplet":
-            group = allowed[signature]
-            archived[group] = dict(nodes=list(group), messages=messages)
-    if set(archived) != set(TRIPLETS):
-        raise ValueError("source does not contain exactly 1,140 triplets")
-    save("prompts.json", dict(context=context, triplets=[archived[g] for g in TRIPLETS],
-        pairs=[dict(nodes=[a, b], messages=chat_messages(mod.triplet.cot_tiebreaker_prompt(a, b, list(NAMES), context)))
-               for a, b in PAIRS]))
-    for seed, n in CONDITIONS:
-        name = f"seed_{seed:02d}_n{n}.json"
-        copy(SOURCE / "records/causal_orderpluspc_plus_qwen3.5-9b" / name, "reference/qwen_records/" + name)
-        for folder, label in (
-            ("gpc-guess_plus_gpt-5.6_terra", "gpc"),
-            ("bfspluspearson_plus_gpt-5.6_terra", "bfs"),
-            ("claim-fuse-smc-active_plus_gpt-5.6_terra", "smc_stated"),
-            ("claim-fuse-smc-active_plus_gpt-5.6_terra_(semantic_consistency)", "smc_consistency"),
-        ):
-            copy(TERRA_SOURCE / "records" / folder / name, f"reference/terra/{label}/{name}")
+    triplets = []
+    for group in TRIPLETS:
+        messages = chat_messages(mod.triplet.generate_subgraph_prompt(list(group), context))
+        audit_model_text("\n".join(message["content"] for message in messages), spec)
+        triplets.append(dict(nodes=list(group), messages=messages))
+    pairs = [dict(nodes=[a, b], messages=chat_messages(
+        mod.triplet.cot_tiebreaker_prompt(a, b, list(NAMES), context))) for a, b in PAIRS]
+    save("prompts.json", dict(context=context, triplets=triplets, pairs=pairs))
+    shutil.rmtree(packaged)
     payload, selected = endpoint()
     save("provider_endpoints.json", payload)
-    save("provenance.json", provenance)
     dated = selected.get("name", "").split(" | ")[-1]
-    implementation = [Path(__file__).resolve(), ROOT / "sbatch/neuropathic_causal_order_terra.sbatch",
-                      ROOT / "code/tests/unit/experiments/test_neuropathic_causal_order_terra.py"]
-    implementation += list((ROOT / "code/src/cd_llm/baselines/causal_order2025").glob("*.py"))
-    implementation += [ROOT / "code/src/cd_llm/core/finite_support.py", ROOT / "code/src/cd_llm/core/cpc.py"]
-    write_json(root / "manifest.json", dict(study=STUDY, version=1, model=MODEL, provider=PROVIDER,
+    implementation = [Path(__file__).resolve()]
+    implementation += list((CODE_ROOT / "src/cd_llm/baselines/causal_order2025").glob("*.py"))
+    implementation += [CODE_ROOT / "src/cd_llm/core/finite_support.py", CODE_ROOT / "src/cd_llm/core/cpc.py"]
+    write_json(root / "manifest.json", dict(study=STUDY, version=2, model=MODEL, provider=PROVIDER,
         response_models=sorted({MODEL, dated}), response_provider="OpenAI", upstream_revision=UPSTREAM_REVISION,
-        source=str(SOURCE), cost_limit_usd=LIMIT, conditions=CONDITIONS, pc_settings=PC_SETTINGS,
+        input_bundle=protocol()["bundles"]["neuropathic"], cost_limit_usd=LIMIT,
+        conditions=CONDITIONS, pc_settings=PC_SETTINGS,
         request_seed=0, reasoning="none", temperature_supplied=False, concurrency=4,
         triplet_limit=4096, triplet_retry_limit=7680, tie_limit=2048, fallback_limit=256,
         parse_gate=.95, triplet_count=1140, pricing=selected["pricing"], pilot_triplets=pilot_triplets(),
-        inputs=inputs, implementation={str(p.relative_to(ROOT)):sha256(p) for p in implementation},
-        metric_scale="unnormalized", parser="typed_graph_or_ABC_v1", reference_metric_scale="normalized"))
+        inputs=inputs, implementation={str(p.relative_to(CODE_ROOT)):sha256(p) for p in implementation},
+        metric_scale="unnormalized", parser="typed_graph_or_ABC_v1"))
     write_json(root / "status.json", dict(stage="prepared", triplets=0, expected_triplets=1140))
     verify(root)
 
@@ -531,38 +502,17 @@ def integrate_expert(root, expert, fallback_answers):
 
 def reference_audit(root):
     verify(root)
-    from cd_llm.baselines.causal_order2025.api import _run_pc
-    from cd_llm.baselines.causal_order2025 import PCOrderConfig
-    from cd_llm.baselines.causal_order2025.integration import causal_learn_cpdag
     import pandas as pd
     with offline():
-        prompts = read_json(root / "prompts.json")
-        rows = read_json(root / "reference/qwen_responses.json")
-        old = replay_expert(prompts, rows, legacy=True, model="Qwen/Qwen3.5-9B")
-        expected = read_json(root / "reference/qwen_expert.json")
-        actual = expert_record(old)
-        for name in ("raw_edges", "expert_order", "graph", "edgewise_distributions"):
-            if actual[name] != expected[name]:
-                raise ValueError(f"archived expert replay differs: {name}")
-        legacy_records = integrate_expert(root, old, {})
-        for record in legacy_records:
-            archived = read_json(root / f"reference/qwen_records/seed_{record['seed']:02d}_n{record['sample_size']}.json")
-            if record["status"] != "complete" or record["graph"] != archived["graph"]:
-                raise ValueError("archived Qwen graph does not reproduce with frozen PC")
-            for metric in METRICS:
-                expected_value = archived["metrics"][metric] * (190 if metric in METRICS[:2] else 1)
-                if not math.isclose(record["metrics"][metric], expected_value, abs_tol=1e-10):
-                    raise ValueError("archived Qwen metrics do not reproduce")
-        for n in (200,1000):
-            data = pd.read_csv(root / f"inputs/data/seed_00_n{n}.csv").to_numpy()
-            estimated = causal_learn_cpdag(_run_pc(data,NAMES,PCOrderConfig(**PC_SETTINGS),None))
-            if estimated != partial(read_json(root / f"inputs/statistics/seed_00_n{n}.json")["pc"]):
-                raise ValueError("PC settings do not reproduce saved seed-zero CPDAG")
-        corrected = replay_expert(prompts, rows, legacy=False, model="Qwen/Qwen3.5-9B")
-        corrected_records = integrate_expert(root, corrected, {})
-    write_json(root / "reference_replay.json", dict(passed=True, historical_records=legacy_records,
-        corrected_records=corrected_records, corrected_expert=expert_record(corrected),
-        changed_graphs=sum(a.get("graph") != b.get("graph") for a,b in zip(legacy_records,corrected_records)),
+        if len(pcs(root)) != len(CONDITIONS):
+            raise ValueError("packaged PC grid is incomplete")
+        for seed in range(10):
+            small = pd.read_csv(root / f"inputs/data/seed_{seed:02d}_n200.csv")
+            large = pd.read_csv(root / f"inputs/data/seed_{seed:02d}_n1000.csv")
+            if not small.equals(large.iloc[:200].reset_index(drop=True)):
+                raise ValueError("packaged observations are not nested")
+    write_json(root / "reference_replay.json", dict(
+        passed=True, input_only=True, changed_graphs=0,
         manifest_sha256=sha256(root / "manifest.json")))
 
 
@@ -589,7 +539,7 @@ async def collection(root, *, pilot_only=False):
                 if graph_answer(response["content"]) is None:
                     responses[index] = await transport.request(triples[pilot[index]],7680,"triplet_parse_retry")
             parsed = sum(graph_answer(r["content"]) is not None for r in responses)
-            # The archived tie pair can be reused if Terra also needs this pair.
+            # A collected tie pair can be reused if Terra also needs this pair.
             pair = await transport.request(pairs[("V06","V07")],2048,"vote_tiebreaker")
             if not passes_gate(parsed,20) or pair_answer(pair["content"]) is None:
                 raise ValueError("pilot parsing gate failed")
@@ -740,7 +690,7 @@ def integrate(root):
 def report(root):
     verify(root)
     from cd_llm.core.finite_support import point_prediction_metrics
-    from cd_llm.metrics.units import convert_metrics, metric_metadata
+    from cd_llm.metrics.units import metric_metadata
     records, baseline = [], []
     with offline():
         truth = graph(read_json(root / "evaluation/truth.json"))
@@ -756,11 +706,6 @@ def report(root):
             stats = read_json(root / "inputs/statistics" / name)
             for label,key in (("PC","pc"),("GES","ges")):
                 metrics = point_prediction_metrics(partial(stats[key]),truth)
-                baseline.append(dict(method=label,seed=seed,sample_size=n,**{k:metrics[k] for k in METRICS}))
-            for folder,label in (("gpc","gPC-Guess + Terra"),("bfs","BFS+Pearson + Terra"),
-                                 ("smc_stated","SMC-Active stated + Terra"),("smc_consistency","SMC-Active consistency + Terra")):
-                original = read_json(root / f"reference/terra/{folder}" / name)
-                metrics = convert_metrics(original["metrics"],190,source_scale="normalized")
                 baseline.append(dict(method=label,seed=seed,sample_size=n,**{k:metrics[k] for k in METRICS}))
     grouped = defaultdict(list)
     for row in records + baseline:
@@ -783,18 +728,17 @@ def report(root):
     for name in ("per_run.csv","comparison_per_run.csv","summary.csv"):
         write_json(root / (name+".metrics.json"),metric_metadata(20))
     audit = read_json(root / "audit.json")
-    replay = read_json(root / "reference_replay.json")
     lines = ["# Terra Causal Order+PC on the Table 2 benchmark", "",
         "One shared exhaustive 1,140-triplet collection; n=200/1000 and ten paired data seeds. ED and ES are unnormalized. Standard errors are conditional on this shared expert collection.", "",
         f"Required input/output tokens across the collected bank: {audit['input_tokens']:,}/{audit['output_tokens']:,}; requests: {audit['required_requests']}. Each dataset is charged the full shared expert plus its own required PC fallbacks; per_run.csv gives its totals. API purchases occur once.",
         f"Accounted API spending: ${audit['accounting']['accounted_cost_usd']:.6f}; unresolved reservations: ${audit['accounting']['unresolved_reservations_usd']:.6f}; limit: $25. Pilot-only responses: {audit['pilot_only_requests']}.",
         "Token counts cover recorded responses; any requests with unresolved reservations have unknown additional token usage." if not audit['token_expenditure_complete'] else "Token accounting covers all recorded attempts with no unresolved reservations.",
-        f"Parsed triplets: {audit['parseable']}/1140. Corrected A/B/C tie parsing changes {replay['changed_graphs']}/20 historical Qwen graphs; the historical records and correction diagnostic are in reference_replay.json.", "",
+        f"Parsed triplets: {audit['parseable']}/1140. The input audit in reference_replay.json verifies the fixed observations and PC supports before collection.", "",
         "| Method | n | ED (SE) | ES (SE) | Adj. F1 (SE) | Orient. F1 (SE) |", "|---|---:|---:|---:|---:|---:|"]
     for row in summary:
         values = ["infeasible" if row["infeasible"] else f"{row[k+'_mean']:.4f} ({row[k+'_se']:.4f})" for k in METRICS]
         lines.append(f"| {row['method']} | {row['sample_size']} | " + " | ".join(values) + " |")
-    lines += ["", "Prompt messages match the archived Table 2 Causal Order prompts, including the full glossary. Terra uses the pinned OpenAI endpoint, reasoning disabled, and no temperature parameter. Triplet graph responses and A/B/C tie responses use separate parsers. Native infeasibility is retained without graph repair or complete-case aggregation."]
+    lines += ["", "Prompts are generated from the pinned Table 2 template and full masked glossary. Terra uses the pinned OpenAI endpoint, reasoning disabled, and no temperature parameter. Triplet graph responses and A/B/C tie responses use separate parsers. Native infeasibility is retained without graph repair or complete-case aggregation."]
     write_text(root / "report.md","\n".join(lines)+"\n")
     own = [r for r in summary if r["method"] == "Causal Order+PC"]
     if not any(r["infeasible"] for r in own):

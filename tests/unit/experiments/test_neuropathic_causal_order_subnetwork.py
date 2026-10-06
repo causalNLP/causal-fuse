@@ -48,13 +48,13 @@ class NeuropathicCausalOrderSubnetworkTests(unittest.TestCase):
         self.assertEqual(MAX_BENCHMARK_RUNTIME_SECONDS, 3600.0)
         self.assertEqual(METHODS, ("PC", "GES", "Causal Order+PC (Qwen3.5-9B)"))
 
-    def test_task_mapping_covers_twenty_seeds_and_two_sizes(self) -> None:
+    def test_task_mapping_covers_ten_seeds_and_two_sizes(self) -> None:
         self.assertEqual(slice_for_task(0), (0, 200))
         self.assertEqual(slice_for_task(1), (0, 1000))
-        self.assertEqual(slice_for_task(38), (19, 200))
-        self.assertEqual(slice_for_task(39), (19, 1000))
+        self.assertEqual(slice_for_task(18), (9, 200))
+        self.assertEqual(slice_for_task(19), (9, 1000))
         with self.assertRaises(ValueError):
-            slice_for_task(40)
+            slice_for_task(20)
 
     def test_cache_summary_separates_request_purposes(self) -> None:
         with TemporaryDirectory() as directory:

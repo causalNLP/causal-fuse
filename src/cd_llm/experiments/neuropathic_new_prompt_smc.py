@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from collections import defaultdict
 from dataclasses import asdict
 import fcntl
@@ -21,7 +22,7 @@ from cd_llm.methods.llm_claim_confidence import confidence_metrics
 from cd_llm.paths import WORKSPACE_ROOT
 
 from cd_llm.experiments.neuropathic_new_prompt_cache import (
-    STUDY, BUDGETS, prepare, verify, providers, require_cache,
+    STUDY, BUDGETS, prepare, verify, providers, require_cache, fill, audit_cache,
 )
 
 
@@ -181,20 +182,6 @@ def paired_differences(rows):
     return result
 
 
-def archived_differences(rows, historical):
-    index = lambda items: {(r["budget"], r["sample_size"], r["strategy"], r["group"], r["seed"]): r for r in items}
-    current, old = index(rows), index(historical)
-    if set(current) != set(old):
-        raise ValueError("historical comparison grid differs")
-    result = []
-    for b, n, s, g in sorted({key[:4] for key in current}):
-        result.extend(contrast({seed: current[b, n, s, g, seed] for seed in range(10)},
-            {seed: old[b, n, s, g, seed] for seed in range(10)},
-            dict(budget=b, sample_size=n, strategy=s, group=g, comparison="new_api_minus_archived_local",
-                 interpretation="descriptive_prompt_and_provider_confounded")))
-    return result
-
-
 def report(root):
     with original.offline_guard():
         return _report(root)
@@ -234,21 +221,11 @@ def _report(root):
         row["elapsed_seconds"] = sum(r["elapsed_seconds"] for r in members)
         summaries.append(row)
     differences = paired_differences(rows)
-    historical = []
-    for task in manifest["tasks"]:
-        archived = read_json(root / f"reference/records/{task['id']}.json")
-        for budget in BUDGETS:
-            metrics, _ = original.metrics_for(prefix_record(archived, budget), truth)
-            historical.append(json_value(dict(budget=budget, sample_size=task["sample_size"], strategy=task["strategy"],
-                                   group=task["group"], seed=task["seed"], **metrics)))
-    archive_contrasts = archived_differences(rows, historical)
-    write_csv(root / "archived_per_run.csv", historical)
-    write_csv(root / "archived_comparisons.csv", archive_contrasts)
     write_json(root / "summary.json", dict(metric_scale="unnormalized", metric_units=metric_metadata(20), complete=True, trajectories=120, checkpoints=480, summaries=summaries, differences=differences))
     write_csv(root / "per_run.csv", rows)
     write_csv(root / "summary.csv", summaries)
     write_csv(root / "paired_differences.csv", differences)
-    for name in ("summary", "per_run", "paired_differences", "archived_per_run", "archived_comparisons"):
+    for name in ("summary", "per_run", "paired_differences"):
         write_json(root / f"{name}.csv.metrics.json", metric_metadata(20))
     audit = dict(passed=True, trajectories=120, checkpoints=480,
         network_disabled=True, pilot_exact_replays=12,
@@ -257,10 +234,10 @@ def _report(root):
         records=hashes, manifest_sha256=sha256(root / "manifest.json"), cache=require_cache(root))
     write_json(root / "audit.json", audit)
     lines = ["# Neuropathic SMC-active with revised causal-criteria prompts", "",
-        "All 120 trajectories completed, with 480 posterior checkpoints. Qwen3.5-9B through the pinned DeepInfra BF16 API; n=200/1000; ten paired data seeds; stated and consistency confidence; Group I, Group II, and their union. All claim types use revised prompts. The 760 ancestry outcomes were imported from the verified new-prompt API cache.", "",
-        "Each trajectory has 100 distinct attempted questions, including abstentions. Consistency requires six valid answers out of eight; ties return NO at confidence 0.5, otherwise confidence is max(0.5, (majority+0.5)/9). Answers are soft evidence capped at 0.99. The same 384 frozen PC+GES particles and inference seeds are used across conditions, without additional initialization moves. BDeu ESS and structure prior are one, maximum parents 12, EIG working confidence 0.9, ESS threshold 0.5. Mutation uses two proposals per particle, guided mixture 0.5, uniform-pair ordinary kernel, cache size 256.", "",
-        "Checkpoints at 10/20/50/100 are prefixes of each 100-attempt trajectory; no extra terminal mutation is applied at earlier checkpoints. Mutation follows resampling or a valid response at slot 100. The paper says final answered question; this implementation preserves the archived behavior of skipping terminal mutation when slot 100 abstains.", "",
-        "Structural metrics are mean (SE) over ten data seeds. Accuracy and Brier pool valid selected answers; coverage includes all attempted questions. Undefined calibration values remain missing. Paired intervals are nominal 95% percentile bootstrap intervals over available paired seeds, using 10,000 resamples, conditional on the shared cached model responses. Historical comparisons are descriptive: both prompt and provider changed, so differences cannot be attributed solely to prompting.", "",
+        "All 120 trajectories completed, with 480 posterior checkpoints. Qwen3.5-9B through the pinned DeepInfra BF16 API; n=200/1000; ten paired data seeds; stated and consistency confidence; Group I, Group II, and their union. All claim types use revised prompts and every outcome was collected for this run.", "",
+        "Each trajectory has 100 distinct attempted questions, including abstentions. Consistency requires six valid answers out of eight; ties return NO at confidence 0.5, otherwise confidence is max(0.5, (majority+0.5)/9). Answers are soft evidence capped at 0.99. The same 384 fixed PC+GES particles and inference seeds are used across conditions, without additional initialization moves. BDeu ESS and structure prior are one, maximum parents 12, EIG working confidence 0.9, ESS threshold 0.5. Mutation uses two proposals per particle, guided mixture 0.5, uniform-pair ordinary kernel, cache size 256.", "",
+        "Checkpoints at 10/20/50/100 are prefixes of each 100-attempt trajectory; no extra terminal mutation is applied at earlier checkpoints. Mutation follows resampling or a valid response at slot 100. The paper says final answered question; this implementation skips terminal mutation when slot 100 abstains.", "",
+        "Structural metrics are mean (SE) over ten data seeds. Accuracy and Brier pool valid selected answers; coverage includes all attempted questions. Undefined calibration values remain missing. Paired intervals are nominal 95% percentile bootstrap intervals over available paired seeds, using 10,000 resamples, conditional on the freshly collected model responses.", "",
         "| Queries | n | Confidence | Group | ED (SE) | Adjacency F1 (SE) | Orientation F1 (SE) | Accuracy | Brier | Coverage |",
         "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|"]
     def fmt(value):
@@ -269,24 +246,28 @@ def _report(root):
         values = " | ".join(f"{r[m + '_mean']:.6f} ({r[m + '_se']:.6f})" for m in original.METRICS)
         lines.append(f"| {r['budget']} | {r['sample_size']} | {r['strategy']} | {r['group']} | {values} | {fmt(r['accuracy'])} | {fmt(r['brier'])} | {r['coverage']:.4f} |")
     cache = audit["cache"]
-    lines += ["", f"New API calls: {cache['new_raw_requests']}; reported/estimated new cost: ${cache['new_accounting']['accounted_cost_usd']:.6f}; unresolved reservations: ${cache['new_accounting']['unresolved_reservations_usd']:.6f}. Imported ancestry source cost (not billed again): ${cache['imported_source_cost_usd']:.6f}.", "",
-        "The CSV files include all within-study paired structural/calibration contrasts, separate descriptive comparisons to archived results, coverage, abstentions, claim-type counts, request/token counts, inference timing, and MH diagnostics. Cached answers are revealed only after query selection; truth is used only for evaluation."]
+    lines += ["", f"New API calls: {cache['new_raw_requests']}; reported/estimated new cost: ${cache['new_accounting']['accounted_cost_usd']:.6f}; unresolved reservations: ${cache['new_accounting']['unresolved_reservations_usd']:.6f}.", "",
+        "The CSV files include all within-study paired structural/calibration contrasts, coverage, abstentions, claim-type counts, request/token counts, inference timing, and MH diagnostics. Cached answers are revealed only after query selection; truth is used only for evaluation."]
     write_text(root / "report.md", "\n".join(lines) + "\n")
     write_json(root / "completion.json", dict(complete=True, audit_passed=True, trajectories=120, checkpoints=480,
         manifest_sha256=sha256(root / "manifest.json"), audit_sha256=sha256(root / "audit.json"),
-        artifacts={name: sha256(root / name) for name in ("summary.json", "summary.csv", "per_run.csv", "paired_differences.csv", "archived_comparisons.csv", "report.md")}))
+        artifacts={name: sha256(root / name) for name in ("summary.json", "summary.csv", "per_run.csv", "paired_differences.csv", "report.md")}))
     write_json(root / "status.json", dict(stage="complete", trajectories=120, checkpoints=480))
     print(f"Completed report: {root / 'report.md'}", flush=True)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("prepare", "run-block", "validate-pilot", "report"))
+    parser.add_argument("stage", choices=("prepare", "pilot", "collect", "audit", "run-block", "validate-pilot", "report"))
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--block", type=int)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     root = WORKSPACE_ROOT / "results" / run_id(args.run_id) / STUDY
-    if args.stage == "run-block":
+    if args.stage in ("pilot", "collect"):
+        asyncio.run(fill(root, pilot_only=args.stage == "pilot"))
+    elif args.stage == "audit":
+        audit_cache(root)
+    elif args.stage == "run-block":
         if args.block is None:
             parser.error("run-block requires --block")
         run_block(root, args.block)

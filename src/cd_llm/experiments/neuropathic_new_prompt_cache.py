@@ -7,23 +7,21 @@ from email.utils import parsedate_to_datetime
 import fcntl
 import json
 import math
-import shutil
 import sqlite3
 import time
-import urllib.request
+from pathlib import Path
 
 from cd_llm.baselines.causal_order2025.openrouter_backend import ResponseCache
 from cd_llm.experiments import neuropathic_ancestry_prompt_api as api
 from cd_llm.experiments import neuropathic_ancestry_prompt_ablation as local
 from cd_llm.experiments import neuropathic_claim_group_ablation as original
 from cd_llm.experiments.common.artifacts import read_json, sha256, write_json
+from cd_llm.experiments.common.reproduction_inputs import materialize, protocol
 from cd_llm.experiments.neuropathic_claim_cache import sqlite_snapshot
 from cd_llm.methods.active_query import ClaimQuery, QueryResponse, dag_query_pool
-from cd_llm.paths import WORKSPACE_ROOT
+from cd_llm.paths import CODE_ROOT
 
 STUDY = "neuropathic_new_prompt_smc"
-ANCESTRY = WORKSPACE_ROOT / "results/20260917T205734Z/neuropathic_ancestry_prompt_api"
-REFERENCE = WORKSPACE_ROOT / "results/20260917T174601Z/neuropathic_claim_group_checkpoints"
 BUDGETS = (10, 20, 50, 100)
 
 
@@ -206,13 +204,13 @@ def verify(root):
     manifest = read_json(root / "manifest.json")
     if manifest["tasks"] != original.tasks() or manifest["budgets"] != list(BUDGETS):
         raise ValueError("task grid differs")
-    if manifest["settings"] != api.SETTINGS or manifest["cost_limit_usd"] != 1.0:
+    if manifest["settings"] != api.SETTINGS or manifest["cost_limit_usd"] != 2.0:
         raise ValueError("API settings differ")
     for name, digest in manifest["inputs"].items():
         if sha256(root / name) != digest:
             raise ValueError(f"frozen input changed: {name}")
     for name, digest in manifest["implementation"].items():
-        if sha256(WORKSPACE_ROOT / name) != digest:
+        if sha256(CODE_ROOT / name) != digest:
             raise ValueError(f"frozen implementation changed: {name}")
     if read_json(root / "prompts.json") != prompt_templates():
         raise ValueError("prompt templates differ")
@@ -222,89 +220,51 @@ def verify(root):
 def prepare(root):
     if (root / "manifest.json").exists():
         return verify(root)
-    inputs = {}
-    def copy(source, name, digest=None):
-        digest = digest or sha256(source)
-        if sha256(source) != digest:
-            raise ValueError(f"source changed: {source}")
-        target = root / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
-        if sha256(target) != digest:
-            raise ValueError("copy differs")
-        inputs[name] = digest
-
-    sources = {}
-    for label, source in (("ancestry", ANCESTRY), ("reference", REFERENCE)):
-        completion, manifest = read_json(source / "completion.json"), read_json(source / "manifest.json")
-        if not completion["complete"] or not completion["audit_passed"] or completion["manifest_sha256"] != sha256(source / "manifest.json"):
-            raise ValueError("source not complete and audited")
-        audit_hash = completion.get("audit_sha256") or completion["artifacts"]["audit.json"]
-        if sha256(source / "audit.json") != audit_hash:
-            raise ValueError("source audit changed")
-        for name, digest in completion.get("artifacts", {}).items():
-            if sha256(source / name) != digest:
-                raise ValueError(f"source artifact changed: {name}")
-        sources[label] = manifest
-        for name in ("manifest.json", "completion.json", "audit.json"):
-            copy(source / name, f"{label}/{name}")
-    reference = sources["reference"]
-    for name, digest in reference["inputs"].items():
-        if name.startswith(("inputs/", "initializations/", "evaluation/")):
-            copy(REFERENCE / name, name, digest)
-    # Rebuild historical comparison metrics from the audited distributions, not an unaudited CSV.
-    audit = read_json(REFERENCE / "audit.json")
-    for task in original.tasks():
-        copy(REFERENCE / f"records/{task['id']}.json", f"reference/records/{task['id']}.json", audit["records"][task["id"]])
-    ancestry = sources["ancestry"]
-    for name in ("responses.json", "cache/raw_responses.json"):
-        copy(ANCESTRY / name, "ancestry/" + name)
-    if read_json(root / "inputs/model_metadata.json") != read_json(ANCESTRY / "reference/inputs/model_metadata.json"):
-        raise ValueError("ancestry and observations have different node metadata")
-    if sha256(root / "evaluation/truth_graph.json") != sha256(ANCESTRY / "evaluation/truth_graph.json"):
-        raise ValueError("source truth differs")
-    with urllib.request.urlopen(api.ENDPOINT_URL, timeout=30) as response:
-        endpoints = json.load(response)
-    selected = [e for e in endpoints["data"]["endpoints"] if e["tag"] == api.ENDPOINT]
-    if len(selected) != 1:
-        raise RuntimeError("pinned endpoint unavailable")
-    endpoint = selected[0]
-    if not {"seed", "reasoning", "temperature", "max_tokens"}.issubset(endpoint["supported_parameters"]):
-        raise RuntimeError("endpoint does not support required controls")
-    if float(endpoint["pricing"]["prompt"]) > 1e-7 or float(endpoint["pricing"]["completion"]) > 1.5e-7:
-        raise RuntimeError("endpoint prices exceed the planned rates")
-    for name, value in (("prompts.json", prompt_templates()), ("endpoint_snapshot.json", endpoints)):
-        write_json(root / name, value)
-        inputs[name] = sha256(root / name)
-    names = set(reference["implementation"]) | set(ancestry["implementation"])
-    names.update(("code/src/cd_llm/experiments/neuropathic_new_prompt_cache.py",
-        "code/src/cd_llm/experiments/neuropathic_new_prompt_smc.py",
-        "code/scripts/run_neuropathic_new_prompt_smc.py", "code/scripts/submit_neuropathic_new_prompt_smc.py",
-        "sbatch/neuropathic_new_prompt_smc.sbatch"))
+    inputs = materialize("neuropathic", root)
+    if read_json(root / "prompts.json") != prompt_templates():
+        raise ValueError("packaged neuropathic prompts differ from the implementation")
+    settings = protocol()["hosted_models"]["qwen"]
+    if settings["model"] != api.MODEL or settings["provider"] != api.ENDPOINT:
+        raise ValueError("registered hosted Qwen route differs")
+    implementation_paths = (
+        Path(__file__),
+        Path(__file__).with_name("neuropathic_new_prompt_smc.py"),
+        Path(original.__file__),
+        Path(local.__file__),
+        Path(api.__file__),
+    )
+    implementation = {
+        str(path.resolve().relative_to(CODE_ROOT.resolve())): sha256(path)
+        for path in implementation_paths
+    }
+    configuration = dict(
+        budget=100, checkpoints=list(BUDGETS), budget_unit="attempted",
+        groups=original.GROUPS, confidence_methods=list(local.STRATEGIES),
+        consistency_variants=8, consistency_minimum_valid=6,
+        particle_count=384, score="BDeu", equivalent_sample_size=1,
+        structure_prior=1, max_parents=12, policy="eig",
+        selection_confidence=.9, soft_confidence_cap=.99,
+        ess_threshold_fraction=.5, rejuvenation_steps=2,
+        rejuvenate_after_every_query=False, guided_mixture_probability=.5,
+        proposal_cache_size=256, ordinary_kernel="uniform_pair",
+        prompt_condition="causal criteria for every claim type",
+    )
     manifest = dict(study=STUDY, version=1, tasks=original.tasks(), budgets=list(BUDGETS),
-        inputs=inputs, implementation={name: sha256(WORKSPACE_ROOT / name) for name in sorted(names)},
-        settings=api.SETTINGS, pricing=endpoint["pricing"], endpoint=endpoint, seeds=ancestry["seeds"],
-        cost_limit_usd=1.0, nominal_new_requests=5130, expected_outcomes=1900, reused_ancestry_outcomes=760,
+        input_bundle=protocol()["bundles"]["neuropathic"], inputs=inputs,
+        implementation=implementation, settings=api.SETTINGS,
+        pricing=dict(prompt="0.0000001", completion="0.00000015"),
+        endpoint=dict(tag=api.ENDPOINT, model_id=api.MODEL),
+        seeds=dict(stated=19094550, consistency=2881584013),
+        cost_limit_usd=2.0, nominal_new_requests=8550, expected_outcomes=1900,
         concurrency=4, max_transport_attempts=20, retry_cooldown_seconds=[30, 300],
-        configuration=dict(reference["configuration"], confidence_methods=["stated", "consistency"],
-            consistency_minimum_valid=6, prompt_condition="new for every claim type", model=api.MODEL,
-            comparison="archived local old prompt: descriptive, provider and prompt confounded"))
-    # Confirm that ancestry requests match byte-for-byte before any new paid request.
-    imported_raw = read_json(root / "ancestry/cache/raw_responses.json")
-    imported_rows = [r for r in read_json(root / "ancestry/responses.json") if r["condition"] == "new"]
-    async def preflight():
-        with original.offline_guard():
-            chat = api.OfflineChat(imported_raw, manifest)
-            return [await elicit(q, s, chat, load_inputs(root)) for q in local.questions() for s in local.STRATEGIES]
-    if asyncio.run(preflight()) != imported_rows or len(imported_rows) != 760:
-        raise ValueError("imported ancestry does not reproduce under the registered prompts/settings")
+        configuration=configuration)
     write_json(root / "manifest.json", manifest)
-    print(f"Prepared {root}: 120 trajectories, 480 checkpoints; 5,130 new nominal requests, $1 cap.", flush=True)
+    print(f"Prepared {root}: 120 trajectories, 480 checkpoints; all model answers will be collected fresh.", flush=True)
     return manifest
 
 
 def tasks():
-    return [(q, s) for q in dag_query_pool(20, original.GROUPS["group_i"]) for s in local.STRATEGIES]
+    return [(q, s) for q in dag_query_pool(20, original.GROUPS["all"]) for s in local.STRATEGIES]
 
 
 async def fill(root, *, pilot_only=False):
@@ -315,15 +275,15 @@ async def fill(root, *, pilot_only=False):
         chat = APIChat(cache, manifest)
         completed, started = {}, time.monotonic()
         def status(stage):
-            write_json(root / "status.json", dict(stage=stage, completed_group_i_outcomes=len(completed),
-                expected_group_i_outcomes=1140, reused_ancestry_outcomes=760,
+            write_json(root / "status.json", dict(stage=stage, completed_outcomes=len(completed),
+                expected_outcomes=1900,
                 elapsed_seconds=time.monotonic() - started, cache=cache.summary(), accounting=chat.accounting()))
         async def run(task):
             row = await elicit(*task, chat, inputs)
             completed[task[0].query_id, task[1]] = row
             if len(completed) % 20 == 0:
                 status("filling")
-                print(f"Group I {len(completed)}/1140 outcomes; ${chat.accounting()['budget_used_usd']:.4f}", flush=True)
+                print(f"Claim outcomes {len(completed)}/1900; ${chat.accounting()['budget_used_usd']:.4f}", flush=True)
             return row
         heartbeat_stop = asyncio.Event()
         async def heartbeat():
@@ -335,7 +295,7 @@ async def fill(root, *, pilot_only=False):
                     pass
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            queries = dag_query_pool(20, original.GROUPS["group_i"])
+            queries = dag_query_pool(20, original.GROUPS["all"])
             pilot_queries = [next(q for q in queries if q.kind == kind) for kind in ("directed", "adjacency")]
             pilot = await asyncio.gather(*(run((q, s)) for q in pilot_queries for s in local.STRATEGIES), return_exceptions=True)
             errors = [r for r in pilot if isinstance(r, BaseException)]
@@ -366,8 +326,7 @@ async def fill(root, *, pilot_only=False):
             errors = [r for r in results if isinstance(r, BaseException)]
             if errors:
                 raise RuntimeError(str(errors[0]))
-            imported = [r for r in read_json(root / "ancestry/responses.json") if r["condition"] == "new"]
-            rows = [completed[q.query_id, s] for q, s in tasks()] + imported
+            rows = [completed[q.query_id, s] for q, s in tasks()]
             write_json(root / "responses.json", rows)
             write_json(root / "accounting.json", chat.accounting())
         except BaseException as exc:
@@ -385,13 +344,10 @@ async def fill(root, *, pilot_only=False):
 def audit_cache(root):
     manifest, inputs = verify(root), load_inputs(root)
     raw = sqlite_snapshot(root / "cache/responses.sqlite3")
-    ancestry_raw = read_json(root / "ancestry/cache/raw_responses.json")
     async def replay():
         with original.offline_guard():
             own = api.OfflineChat(raw, manifest)
-            imported = api.OfflineChat(ancestry_raw, manifest)
-            return ([await elicit(q, s, own, inputs) for q, s in tasks()] +
-                    [await elicit(q, s, imported, inputs) for q in local.questions() for s in local.STRATEGIES])
+            return [await elicit(q, s, own, inputs) for q, s in tasks()]
     rows = asyncio.run(replay())
     if rows != read_json(root / "responses.json") or len(rows) != 1900:
         raise ValueError("cache replay differs or incomplete")
@@ -410,14 +366,12 @@ def audit_cache(root):
     if len(attempts) != accounting["attempts"] or not math.isclose(sum(r["charged_usd"] or 0 for r in attempts), accounting["accounted_cost_usd"], abs_tol=1e-10):
         raise ValueError("accounting differs from ledger")
     uncertain = sum(r["reserved_usd"] for r in attempts if r["charged_usd"] is None)
-    if not math.isclose(uncertain, accounting["unresolved_reservations_usd"], abs_tol=1e-10) or accounting["budget_used_usd"] > 1:
+    if (not math.isclose(uncertain, accounting["unresolved_reservations_usd"], abs_tol=1e-10)
+            or accounting["budget_used_usd"] > manifest["cost_limit_usd"]):
         raise ValueError("invalid budget accounting")
     write_json(root / "cache/raw_responses.json", raw)
     write_json(root / "cache/api_attempts.json", attempts)
-    imported = [r for r in rows if r["query"]["kind"] == "ancestry"]
-    gate = dict(passed=True, outcomes=1900, new_raw_requests=len(raw), imported_outcomes=760,
-        imported_raw_requests=len({k for r in imported for k in r["request_keys"]}),
-        imported_source_cost_usd=sum(r["cost_usd"] for r in imported), new_accounting=accounting,
+    gate = dict(passed=True, outcomes=1900, new_raw_requests=len(raw), new_accounting=accounting,
         manifest_sha256=sha256(root / "manifest.json"),
         artifacts={name: sha256(root / name) for name in ("responses.json", "cache/raw_responses.json", "cache/api_attempts.json", "accounting.json")})
     write_json(root / "cache_audit.json", gate)
@@ -443,8 +397,7 @@ def response_for(row, manifest=None):
         audit=dict(request_keys=row["request_keys"], votes=[d["answer"] for d in decisions],
             valid_response_count=sum(d["status"] == "valid" for d in decisions),
             minimum_valid_response_count=6 if row["strategy"] == "consistency" else 1,
-            source=("fresh-model-cache" if manifest is not None else
-                    "imported-new-ancestry" if row["query"]["kind"] == "ancestry" else "new-group-i"),
+            source="fresh-model-cache",
             model=api.MODEL if manifest is None else manifest["settings"]["model"],
             provider=api.ENDPOINT if manifest is None else manifest["settings"]["provider"]["only"][0]))
 

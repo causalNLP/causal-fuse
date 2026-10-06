@@ -26,12 +26,13 @@ from cd_llm.baselines.jiralerspong2024 import Complete, openai_completer, run_bf
 from cd_llm.core.finite_support import graph_from_edges, point_prediction_metrics
 from cd_llm.data.generation.neuropathic import CANONICAL_VARIABLE_NAMES
 from cd_llm.experiments.common.artifacts import run_id, write_csv, write_json
-from cd_llm.paths import WORKSPACE_ROOT
+from cd_llm.metrics.units import metric_metadata
+from cd_llm.paths import RESOURCE_ROOT, WORKSPACE_ROOT
 
 
 BENCHMARK_ID = "table45-neuropathic-ancestor20-v1"
 KIT_PREFIX = "20260826T120230Z/table45_benchmark_kit"
-DEFAULT_ARCHIVE = Path("20260826T120230Z.zip")
+DEFAULT_ARCHIVE = RESOURCE_ROOT / "reproduction" / "neuropathic_benchmark.zip"
 DEFAULT_RESULTS_ROOT = WORKSPACE_ROOT / "results"
 SAMPLE_SIZES = (200, 1000)
 SEEDS = tuple(range(20))
@@ -219,6 +220,7 @@ def aggregate(output_dir: Path) -> list[dict]:
         row["output_tokens"] = sum(run["cost"]["output_tokens"] for run in group)
         rows.append(row)
     write_csv(output_dir / "summary.csv", rows)
+    write_json(output_dir / "summary.csv.metrics.json", metric_metadata(20))
     return rows
 
 

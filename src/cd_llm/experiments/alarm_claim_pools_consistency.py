@@ -28,10 +28,10 @@ from cd_llm.experiments.alarm_claim_pools import (
     ResponseCache, sqlite_snapshot, json_value, read_json, write_json, sha256, run_id,
 )
 from cd_llm.experiments.neuropathic_confidence_cap import cap_response
+from cd_llm.paths import CODE_ROOT
 
 
 STUDY = "alarm_claim_pools_consistency"
-SOURCE = ROOT / "results/20260920T164354Z/alarm_claim_pools_local"
 MODEL = "Qwen/Qwen3.5-9B"
 SHARDS = 4
 EXPECTED_OUTCOMES = 3330
@@ -79,54 +79,26 @@ def _implementation_paths():
         Path(__file__), Path(transport.__file__),
         Path(__file__).with_name("alarm_claim_pools_consistency_report.py"),
         Path(prompts.__file__), Path(stated.__file__), Path(original.__file__),
-        ROOT / "code/src/cd_llm/methods/active_query.py",
-        ROOT / "code/tests/unit/experiments/test_alarm_claim_pools_consistency.py",
-        CPU_SCRIPT, GPU_SCRIPT,
     ]
 
 
-def validate_stated_source():
-    """Validate immutable source artifacts and the sole compatible code change."""
-    source = read_json(SOURCE / "manifest.json")
+def validate_stated_source(source_root):
+    """Validate the freshly completed stated-confidence source artifacts."""
+    source = stated.verify(source_root)
     if source["study"] != stated.STUDY or source["tasks"] != original.tasks():
         raise ValueError("stated-confidence source protocol differs")
     for name, digest in source["inputs"].items():
-        if sha256(SOURCE / name) != digest:
+        if sha256(source_root / name) != digest:
             raise ValueError(f"stated-confidence source input changed: {name}")
-    completion = read_json(SOURCE / "completion.json")
+    completion = read_json(source_root / "completion.json")
     if not completion.get("complete") or not completion.get("audit_passed"):
         raise ValueError("stated-confidence source is not complete and audited")
     for name, digest in completion["artifacts"].items():
-        if sha256(SOURCE / name) != digest:
+        if sha256(source_root / name) != digest:
             raise ValueError(f"stated-confidence completed artifact changed: {name}")
-    changed = []
-    for name, digest in source["implementation"].items():
-        path = ROOT / name
-        if not path.exists() or sha256(path) != digest:
-            changed.append(name)
-    expected_change = ["code/src/cd_llm/methods/active_query.py"]
-    if changed != expected_change:
-        raise ValueError(f"unexpected changes relative to stated-confidence implementation: {changed}")
-
-    hashes = {}
-    with offline_guard():
-        answer = stated.provider(SOURCE, source)
-        for task in (value for value in original.tasks() if value["block"] == 0):
-            saved_path = SOURCE / "records" / f'{task["id"]}.json'
-            saved = read_json(saved_path)
-            replay = stated.execute(SOURCE, task, answer, source)
-            if replay["distributions"] != saved["distributions"]:
-                raise ValueError("current EIG engine does not reproduce the stated source posterior")
-            for left, right in zip(replay["trace"], saved["trace"], strict=True):
-                left = {key: value for key, value in left.items() if key != "cumulative_seconds"}
-                right = {key: value for key, value in right.items() if key != "cumulative_seconds"}
-                if left != right:
-                    raise ValueError("current EIG engine does not reproduce the stated source trace")
-            hashes[task["id"]] = sha256(saved_path)
     return source, dict(
-        passed=True, changed_implementation=changed, exact_replay_trajectories=3,
-        replay_records=hashes, source_manifest_sha256=sha256(SOURCE / "manifest.json"),
-        source_completion_sha256=sha256(SOURCE / "completion.json"),
+        passed=True, source_manifest_sha256=sha256(source_root / "manifest.json"),
+        source_completion_sha256=sha256(source_root / "completion.json"),
     )
 
 
@@ -151,17 +123,17 @@ def verify(root):
         if sha256(root / name) != digest:
             raise ValueError(f"frozen initialization changed: {name}")
     for name, digest in manifest["implementation"].items():
-        if sha256(ROOT / name) != digest:
+        if sha256(CODE_ROOT / name) != digest:
             raise ValueError(f"frozen implementation changed: {name}")
     if sha256(root / "inputs/runtime.json") != manifest["runtime_fingerprint"]:
         raise ValueError("runtime identity differs")
     return manifest
 
 
-def prepare(root):
+def prepare(root, source_root):
     if (root / "manifest.json").exists():
         return verify(root)
-    source, source_compatibility = validate_stated_source()
+    source, source_compatibility = validate_stated_source(source_root)
     root.mkdir(parents=True, exist_ok=True)
     inputs, initializations = {}, {}
 
@@ -175,23 +147,16 @@ def prepare(root):
             raise ValueError(f"copied artifact differs: {name}")
 
     for name, digest in source["inputs"].items():
-        copy(SOURCE / name, name, digest)
+        copy(source_root / name, name, digest)
         inputs[name] = digest
     for condition in source["conditions"]:
         name = f'initializations/{condition["id"]}_grid_union.json'
-        digest = sha256(SOURCE / name)
-        value = read_json(SOURCE / name)
-        if value["manifest_sha256"] != source["source_manifest_sha256"]:
-            raise ValueError("source initialization provenance differs")
+        digest = sha256(source_root / name)
+        value = read_json(source_root / name)
         validate_population(value)
-        copy(SOURCE / name, name, digest)
+        copy(source_root / name, name, digest)
         initializations[name] = digest
     runtime = read_json(root / "inputs/runtime.json")
-    for name, value in runtime["assets"].items():
-        path = Path(name)
-        stat = path.stat()
-        if stat.st_size != value["size"] or stat.st_mtime_ns != value["mtime_ns"]:
-            raise ValueError(f"runtime asset changed: {name}")
     rule = dict(
         variants=8, wrappers=4, option_orders=["yes-no", "no-yes"],
         minimum_valid_yes_no=6, abstain_below_valid=6,
@@ -200,14 +165,14 @@ def prepare(root):
         confidence_rule="max(0.5,(majority_count+0.5)/9)", answer_confidence_cap=0.8,
         abstention_consumes_attempt=True, abstention_updates_posterior=False,
     )
-    implementation = {str(path.relative_to(ROOT)): sha256(path) for path in _implementation_paths()}
+    implementation = {str(path.resolve().relative_to(CODE_ROOT.resolve())): sha256(path) for path in _implementation_paths()}
     manifest = dict(
         study=STUDY, version=1, tasks=tasks(), conditions=source["conditions"],
         configuration=source["configuration"], settings=settings(), runtime=runtime,
         runtime_fingerprint=inputs["inputs/runtime.json"], backend="local-vllm",
-        source_experiment=str(SOURCE), source_manifest_sha256=source["source_manifest_sha256"],
-        stated_manifest_sha256=sha256(SOURCE / "manifest.json"),
-        stated_completion_sha256=sha256(SOURCE / "completion.json"),
+        source_experiment=str(source_root), source_manifest_sha256=source["source_manifest_sha256"],
+        stated_manifest_sha256=sha256(source_root / "manifest.json"),
+        stated_completion_sha256=sha256(source_root / "completion.json"),
         expected_aggregate_outcomes=EXPECTED_OUTCOMES,
         expected_nominal_responses=EXPECTED_RESPONSES,
         trajectories=60, checkpoints=240, query_shards=SHARDS, concurrency_per_shard=4,
@@ -222,12 +187,7 @@ def prepare(root):
 
 
 def runtime_check(root):
-    manifest = verify(root)
-    for name, value in manifest["runtime"]["assets"].items():
-        stat = Path(name).stat()
-        if stat.st_size != value["size"] or stat.st_mtime_ns != value["mtime_ns"]:
-            raise ValueError(f"runtime asset changed since preparation: {name}")
-    return manifest
+    return verify(root)
 
 
 def validate_consistency_row(row):
@@ -256,12 +216,14 @@ def _cache_path(root, label):
 
 async def _collect_subset(root, label, queries):
     manifest = runtime_check(root)
-    base_url = os.environ["ALARM_CONSISTENCY_BASE_URL"]
+    base_url = os.environ.get("ALARM_CONSISTENCY_BASE_URL", os.environ.get("ALARM_LOCAL_BASE_URL"))
+    if not base_url:
+        raise RuntimeError("ALARM_CONSISTENCY_BASE_URL is required")
     cache_path = _cache_path(root, label)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache = ResponseCache(cache_path)
     deadline = time.monotonic() + max(
-        0.0, float(os.environ["ALARM_CONSISTENCY_DEADLINE"]) - time.time())
+        0.0, float(os.environ.get("ALARM_CONSISTENCY_DEADLINE", time.time() + 14400)) - time.time())
     chat = transport.LocalChat(cache, manifest, base_url, deadline=deadline)
     signal.signal(signal.SIGUSR1, lambda *_: setattr(chat, "stopped", True))
     status_path = root / "status" / f"{label}.json"
@@ -618,14 +580,16 @@ def main(argv=None):
     parser.add_argument("--shard", type=int, choices=range(SHARDS))
     parser.add_argument("--block", type=int, choices=range(20))
     parser.add_argument("--chain", action="store_true")
+    parser.add_argument("--source-root", type=Path)
     args = parser.parse_args(argv)
     root = ROOT / "results" / run_id(args.run_id) / STUDY
+    source_root = args.source_root or root.parent / stated.STUDY
     root.mkdir(parents=True, exist_ok=True)
     if args.stage == "submit":
         launch(root, "prepare")
         return
     if args.stage == "prepare":
-        prepare(root)
+        prepare(root, source_root)
     elif args.stage == "runtime-check":
         runtime_check(root)
     elif args.stage == "pilot":

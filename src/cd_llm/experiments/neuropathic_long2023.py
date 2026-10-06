@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import statistics
 import time
 from pathlib import Path
 from typing import Sequence
@@ -19,7 +21,7 @@ from cd_llm.baselines.long2023 import (
     run_long,
 )
 from cd_llm.core.finite_support import distribution_metrics
-from cd_llm.experiments.common.artifacts import run_id, write_json
+from cd_llm.experiments.common.artifacts import run_id, write_csv, write_json
 from cd_llm.experiments.neuropathic_bfs2024 import (
     DEFAULT_ARCHIVE,
     DESCRIPTIONS as PANEL_C_DESCRIPTIONS,
@@ -28,6 +30,7 @@ from cd_llm.experiments.neuropathic_bfs2024 import (
     load_truth as load_panel_c_truth,
 )
 from cd_llm.methods.adaptive_pruning import CompletionEnumerationLimitError
+from cd_llm.metrics.units import metric_metadata
 from cd_llm.paths import WORKSPACE_ROOT
 
 
@@ -124,6 +127,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         )
         return
+    records = []
     for sample_size in args.sample_sizes:
         for seed in args.seeds:
             args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -132,6 +136,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             if path.exists() and not args.overwrite:
                 print(f"skip existing {path}", flush=True)
+                records.append(json.loads(path.read_text(encoding="utf-8")))
                 continue
             data, names, truth, digest = _load_condition(args, seed, sample_size)
             metadata = tuple(full_variable_name(name) for name in names)
@@ -168,6 +173,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 expert = openrouter_expert(
                     args.model, args.base_url, args.prompt_seed, args.expert_cache
                 )
+                method_started = time.perf_counter()
                 result = run_long(
                     cpdag,
                     metadata,
@@ -183,6 +189,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "status": "success",
                         "strategy": args.strategy,
                         "model": args.model,
+                        "runtime_seconds": time.perf_counter() - method_started,
                         "final_mec_size": len(result.final_mec),
                         "retained_probability": result.retained_probability,
                         "query_count": len(result.expert_records),
@@ -205,7 +212,45 @@ def main(argv: Sequence[str] | None = None) -> None:
                     }
                 )
             write_json(path, row)
+            records.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
+    if not args.preflight_only:
+        write_summary(args.output_dir, records)
+
+
+def write_summary(output_dir: Path, records: Sequence[dict]) -> None:
+    successful = [record for record in records if record.get("status") == "success"]
+    per_seed = []
+    for record in successful:
+        metrics = record["metrics"]
+        per_seed.append({
+            "method": "PC+Long-Srisk", "sample_size": int(record["sample_size"]),
+            "seed": int(record["seed"]),
+            **{name: float(metrics[name]) for name in (
+                "expected_distance", "energy_score", "adjacency_f1", "orientation_f1")},
+            "logical_requests": int(record["query_count"]),
+            "input_tokens": int(record["input_tokens"]),
+            "output_tokens": int(record["output_tokens"]),
+            "total_tokens": int(record["input_tokens"]) + int(record["output_tokens"]),
+            "runtime_seconds": float(record["runtime_seconds"]),
+        })
+    rows = []
+    for sample_size in sorted({row["sample_size"] for row in per_seed}):
+        selected = [row for row in per_seed if row["sample_size"] == sample_size]
+        row = {"method": "PC+Long-Srisk", "sample_size": sample_size,
+               "replicate_count": len(selected)}
+        for name in ("expected_distance", "energy_score", "adjacency_f1", "orientation_f1",
+                     "logical_requests", "input_tokens", "output_tokens", "total_tokens", "runtime_seconds"):
+            values = [float(item[name]) for item in selected]
+            row[name + "_mean"] = statistics.fmean(values)
+            row[name + "_se"] = statistics.stdev(values) / math.sqrt(len(values)) if len(values) > 1 else 0.0
+        rows.append(row)
+    if not rows:
+        raise RuntimeError("PC+Long produced no successful records")
+    write_csv(output_dir / "per_seed.csv", per_seed)
+    write_csv(output_dir / "summary.csv", rows)
+    write_json(output_dir / "per_seed.csv.metrics.json", metric_metadata(20))
+    write_json(output_dir / "summary.csv.metrics.json", metric_metadata(20))
 
 
 if __name__ == "__main__":

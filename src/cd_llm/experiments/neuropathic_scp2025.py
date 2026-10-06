@@ -4,6 +4,8 @@ import argparse
 import contextlib
 import io
 import json
+import math
+import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -35,7 +37,7 @@ from cd_llm.data.generation.neuropathic import (
     generate_dataset,
     load_model,
     output_stem,
-    write_csv,
+    write_csv as write_neuropathic_csv,
     write_metadata,
 )
 from cd_llm.data.loaders.neuropathic import (
@@ -45,7 +47,8 @@ from cd_llm.data.loaders.neuropathic import (
     select_ancestrally_closed_module,
     variable_description,
 )
-from cd_llm.experiments.common.artifacts import run_id, write_json
+from cd_llm.experiments.common.artifacts import run_id, write_csv, write_json
+from cd_llm.metrics.units import metric_metadata
 from cd_llm.methods.fci.graph import ARROW, CIRCLE, TAIL, PAGGraph
 from cd_llm.paths import RESOURCE_ROOT, WORKSPACE_ROOT
 
@@ -425,8 +428,50 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "seed_evaluation_summaries": summarize_seed_evaluations(records),
         },
     )
+    write_summary(args.output_dir, records)
     print(f"Wrote {aggregate_path}")
     return 0
+
+
+def write_summary(output_dir: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    """Write the paper metrics and logical model cost for each SCP condition."""
+    completed = [record for record in records if record.get("status") == "completed"]
+    grouped: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    for record in completed:
+        grouped.setdefault((int(record["sample_size"]), int(record["pattern"])), []).append(record)
+    rows = []
+    per_seed = []
+    for (sample_size, pattern), group in sorted(grouped.items()):
+        method = f"SCP Pattern {pattern}"
+        selected = []
+        for record in group:
+            metrics = record["final_evaluation_true_graph"]["ceg_fuse_metrics"]
+            cost = record["cost"]
+            item = {
+                "method": method, "sample_size": sample_size, "seed": int(record["seed"]),
+                **{name: float(metrics[name]) for name in (
+                    "expected_distance", "energy_score", "adjacency_f1", "orientation_f1")},
+                **{name: int(cost[name]) for name in ("query_count", "input_tokens", "output_tokens")},
+                "total_tokens": int(cost["input_tokens"]) + int(cost["output_tokens"]),
+                "runtime_seconds": float(record["initial_discovery_seconds"])
+                    + float(record["final_discovery_seconds"]),
+            }
+            selected.append(item)
+            per_seed.append(item)
+        row = {"method": method, "sample_size": sample_size,
+               "replicate_count": len(selected)}
+        for name in ("expected_distance", "energy_score", "adjacency_f1", "orientation_f1",
+                     "input_tokens", "output_tokens", "total_tokens", "query_count", "runtime_seconds"):
+            values = [float(item[name]) for item in selected]
+            row[name + "_mean"] = statistics.fmean(values)
+            row[name + "_se"] = statistics.stdev(values) / math.sqrt(len(values)) if len(values) > 1 else 0.0
+        rows.append(row)
+    if not rows:
+        raise RuntimeError("SCP run produced no completed records")
+    write_csv(output_dir / "per_seed.csv", per_seed)
+    write_csv(output_dir / "summary.csv", rows)
+    write_json(output_dir / "per_seed.csv.metrics.json", metric_metadata(20))
+    write_json(output_dir / "summary.csv.metrics.json", metric_metadata(20))
 
 
 def build_run_plan(
@@ -554,7 +599,7 @@ def generate_missing_datasets(args: argparse.Namespace) -> None:
             if model is None:
                 model = load_model(args.model_path)
             data, observed_indices = generate_dataset(model, args.sample_size, level, seed)
-            write_csv(csv_path, data, observed_indices)
+            write_neuropathic_csv(csv_path, data, observed_indices)
             write_metadata(
                 metadata_path,
                 sample_size=args.sample_size,
@@ -806,6 +851,10 @@ def evaluate_dataset(
             "initial_discovery_seconds": initial.elapsed_seconds,
             "final_discovery_seconds": final.elapsed_seconds,
             "llm_probabilities": probability_records,
+            "cost": {
+                name: sum(int(item["cost"][name]) for item in probability_records)
+                for name in ("query_count", "input_tokens", "output_tokens")
+            },
             "constraint_applications": [asdict(item) for item in applications],
             "bootstrap_endpoint_frequencies": serialize_bootstrap_frequencies(
                 endpoint_frequencies
@@ -995,6 +1044,8 @@ def collect_llm_probabilities(
                 target=target,
             )
             mean_probability, trials = judge.yes_probability(decision_prompt)
+            explanation_usage = judge.cached_usage("explanation", knowledge_prompt)
+            probability_usage = judge.cached_usage("yes_probability", decision_prompt)
             probabilities[(source, target)] = mean_probability
             records.append(
                 {
@@ -1003,6 +1054,10 @@ def collect_llm_probabilities(
                     "mean_yes_probability": mean_probability,
                     "trial_probabilities": trials,
                     "explanation": explanation,
+                    "cost": {
+                        name: explanation_usage[name] + probability_usage[name]
+                        for name in ("query_count", "input_tokens", "output_tokens")
+                    },
                 }
             )
             print(

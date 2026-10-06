@@ -39,20 +39,12 @@ from cd_llm.experiments.common.artifacts import (
     write_text,
 )
 from cd_llm.experiments.neuropathic_decontamination import audit_model_text, build_spec
-from cd_llm.paths import WORKSPACE_ROOT
+from cd_llm.experiments.common.reproduction_inputs import materialize, protocol
+from cd_llm.metrics.units import metric_metadata
+from cd_llm.paths import CODE_ROOT
 
 
 STUDY = "neuropathic_gpc_dag_cpdag"
-SOURCE = (
-    WORKSPACE_ROOT
-    / "results/20260903T011254Z/neuropathic_decontamination/benchmark"
-)
-QWEN_RUNTIME = (
-    WORKSPACE_ROOT
-    / "generated/runtime/20260825T082523Z/qwen35_neuropathic20_manifest.json"
-)
-OLD_TERRA = WORKSPACE_ROOT / "results/20260903T011254Z/neuropathic_decontamination"
-OLD_QWEN = WORKSPACE_ROOT / "results/20260903T022032Z/neuropathic_decontamination_qwen"
 NAMES = tuple(f"V{index:02d}" for index in range(1, 21))
 CONDITIONS = tuple((seed, size) for seed in range(10) for size in (200, 1000))
 MODEL_SPECS = {
@@ -101,15 +93,11 @@ def _metadata(root: Path) -> tuple[dict[str, str], str]:
 
 
 def _implementation_paths() -> tuple[Path, ...]:
-    relative = (
-        "code/src/cd_llm/baselines/guess2graph2026/dag_cpdag.py",
-        "code/src/cd_llm/baselines/guess2graph2026/llm_expert.py",
-        "code/src/cd_llm/experiments/neuropathic_gpc_dag_cpdag.py",
-        "sbatch/neuropathic_gpc_dag_cpdag_qwen.sbatch",
-        "sbatch/neuropathic_gpc_dag_cpdag_terra.sbatch",
-        "sbatch/neuropathic_gpc_dag_cpdag_cpu.sbatch",
+    return (
+        Path(__file__),
+        CODE_ROOT / "src/cd_llm/baselines/guess2graph2026/dag_cpdag.py",
+        CODE_ROOT / "src/cd_llm/baselines/guess2graph2026/llm_expert.py",
     )
-    return tuple(WORKSPACE_ROOT / name for name in relative)
 
 
 def prepare(root: Path) -> dict[str, Any]:
@@ -118,16 +106,15 @@ def prepare(root: Path) -> dict[str, Any]:
     root.mkdir(parents=True, exist_ok=False)
     for folder in ("inputs/data", "prompts", "responses", "experts", "predictions"):
         (root / folder).mkdir(parents=True, exist_ok=True)
-
-    copies = {
-        SOURCE / "model_metadata.json": root / "inputs/model_metadata.json",
-        SOURCE / "truth_graph.json": root / "inputs/truth_graph.json",
-    }
+    packaged = root / "packaged"
+    materialize("neuropathic", packaged)
+    shutil.copyfile(packaged / "inputs/model_metadata.json", root / "inputs/model_metadata.json")
+    shutil.copyfile(packaged / "evaluation/truth_graph.json", root / "inputs/truth_graph.json")
     for seed, size in CONDITIONS:
         name = f"seed_{seed:02d}_n{size}.csv"
-        copies[SOURCE / "data" / name] = root / "inputs/data" / name
-    for source, destination in copies.items():
-        shutil.copyfile(source, destination)
+        data = np.load(packaged / f"inputs/neuropathic_s{seed:02d}_n{size}.npy", allow_pickle=False)
+        np.savetxt(root / "inputs/data" / name, data, fmt="%d", delimiter=",", header=",".join(NAMES), comments="")
+    shutil.rmtree(packaged)
 
     descriptions, context = _metadata(root)
     prompt_hashes: dict[str, str] = {}
@@ -157,18 +144,15 @@ def prepare(root: Path) -> dict[str, Any]:
             write_json(path, payload)
             prompt_hashes[str(path.relative_to(root))] = sha256(path)
 
-    runtime = read_json(QWEN_RUNTIME)
+    runtime = protocol()["local_model"]
     manifest = {
         "study": STUDY,
-        "source": str(SOURCE),
-        "source_manifest_sha256": sha256(SOURCE / "evaluation_manifest.json"),
+        "input_bundle": protocol()["bundles"]["neuropathic"],
         "conditions": [list(value) for value in CONDITIONS],
         "models": MODEL_SPECS,
         "qwen_runtime": {
-            "path": str(QWEN_RUNTIME),
-            "sha256": sha256(QWEN_RUNTIME),
             "model_revision": runtime["model_revision"],
-            "image_sha256": runtime["image_sha256"],
+            "vllm_version": runtime["vllm_version"],
         },
         "settings": {
             "expert_dags": "one per model and data seed, shared across sample sizes",
@@ -187,7 +171,7 @@ def prepare(root: Path) -> dict[str, Any]:
         },
         "prompts": prompt_hashes,
         "implementation": {
-            str(path.relative_to(WORKSPACE_ROOT)): sha256(path)
+            str(path.relative_to(CODE_ROOT)): sha256(path)
             for path in _implementation_paths()
         },
     }
@@ -207,7 +191,7 @@ def verify(root: Path) -> dict[str, Any]:
             if sha256(root / name) != expected:
                 raise ValueError(f"frozen {section[:-1]} changed: {name}")
     for name, expected in manifest["implementation"].items():
-        if sha256(WORKSPACE_ROOT / name) != expected:
+        if sha256(CODE_ROOT / name) != expected:
             raise ValueError(f"frozen implementation changed: {name}")
     return manifest
 
@@ -492,18 +476,6 @@ def _edge_counts(graph: PartialGraph) -> tuple[int, int]:
     return directed, undirected
 
 
-def _old_metrics(model_key: str, seed: int, size: int, truth: Any) -> dict[str, float]:
-    if model_key == "qwen":
-        path = OLD_QWEN / "records/gpc-guess_plus_qwen3.5-9b" / f"seed_{seed:02d}_n{size}.json"
-    else:
-        path = OLD_TERRA / "records/gpc-guess_plus_gpt-5.6_terra" / f"seed_{seed:02d}_n{size}.json"
-    record = read_json(path)
-    matrix = np.zeros((20, 20), dtype=int)
-    for left, right in record["graph"]["edges"]:
-        matrix[int(left), int(right)] = matrix[int(right), int(left)] = int(Endpoint.TAIL)
-    return point_prediction_metrics(PartialGraph.from_matrix(matrix, "cpdag"), truth, normalized=False)
-
-
 def _mean_se(values: Sequence[float]) -> tuple[float, float]:
     return statistics.fmean(values), statistics.stdev(values) / math.sqrt(len(values))
 
@@ -591,20 +563,17 @@ def report(root: Path) -> None:
                 row[name + "_mean"] = mean
                 row[name + "_se"] = se
             summary.append(row)
-            old = [_old_metrics(model_key, seed, size, truth) for seed in range(10)]
-            for method, values in (("Edge-version gPC-Guess", old), (row["method"], group)):
-                comparison_row: dict[str, Any] = {
-                    "method": method,
-                    "model": display,
-                    "sample_size": size,
-                }
-                for name in ("expected_distance", "adjacency_f1", "orientation_f1"):
-                    mean, se = _mean_se([float(item[name]) for item in values])
-                    comparison_row[name + "_mean"] = mean
-                    comparison_row[name + "_se"] = se
-                comparison.append(comparison_row)
+            comparison_row: dict[str, Any] = {
+                "method": row["method"], "model": display, "sample_size": size,
+            }
+            for name in ("expected_distance", "adjacency_f1", "orientation_f1"):
+                comparison_row[name + "_mean"] = row[name + "_mean"]
+                comparison_row[name + "_se"] = row[name + "_se"]
+            comparison.append(comparison_row)
     write_csv(root / "summary.csv", summary)
     write_csv(root / "comparison.csv", comparison)
+    write_json(root / "summary.csv.metrics.json", metric_metadata(20))
+    write_json(root / "comparison.csv.metrics.json", metric_metadata(20))
 
     lines = [
         "# Neuropathic DAG-gPC-Guess CPDAG extension",

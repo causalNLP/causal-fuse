@@ -27,10 +27,10 @@ from cd_llm.experiments.alarm_claim_pools import (
     ResponseCache, sqlite_snapshot, _request_key, json_value, read_json, write_json,
     write_text, sha256, run_id, valid_outcome,
 )
+from cd_llm.experiments.common.reproduction_inputs import materialize, protocol
+from cd_llm.paths import CODE_ROOT
 
 STUDY = 'alarm_claim_pools_local'
-SOURCE = ROOT/'results/20260920T150549Z/alarm_claim_pools'
-RUNTIME_SOURCE = ROOT/'results/20260917T023943Z/neuropathic_valid_answer_budget/inputs/runtime.json'
 MODEL = 'Qwen/Qwen3.5-9B'
 SCRIPT = ROOT/'sbatch/alarm_claim_pools_local.sbatch'
 GPU_SCRIPT = ROOT/'sbatch/alarm_claim_pools_local_gpu.sbatch'
@@ -49,80 +49,44 @@ def verify(root):
             or m['configuration'] != original.configuration()
             or m.get('parsing_policy') != recovery.POLICY):
         raise ValueError('registered local protocol differs')
-    for key, base in (('inputs', root), ('implementation', ROOT)):
+    for key, base in (('inputs', root), ('implementation', CODE_ROOT)):
         for name, digest in m[key].items():
             if sha256(base/name) != digest:
                 raise ValueError(f'frozen {key} changed: {name}')
     if sha256(root/'inputs/runtime.json') != m['runtime_fingerprint']:
         raise ValueError('runtime identity differs')
-    for c in m['conditions']:
-        pop = read_json(root/f'initializations/{c["id"]}_grid_union.json')
-        if pop['manifest_sha256'] != m['source_manifest_sha256']:
-            raise ValueError('initialization is not from the paired source experiment')
     return m
 
 
 def prepare(root):
     if (root/'manifest.json').exists():
         return verify(root)
-    source = original.verify(SOURCE)
     root.mkdir(parents=True, exist_ok=True)
-    inputs = {}
-    def copy(path, name, digest):
-        if sha256(path) != digest:
-            raise ValueError(f'changed source: {path}')
-        dest = root/name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, dest)
-        if sha256(dest) != digest:
-            raise ValueError(f'copy differs: {name}')
-        inputs[name] = digest
-    # No source answer cache or provider metadata is imported.
-    for name, digest in source['inputs'].items():
-        if name != 'provider_endpoints.json':
-            copy(SOURCE/name, name, digest)
-    source_digest = sha256(SOURCE/'manifest.json')
-    copy(SOURCE/'manifest.json', 'inputs/source_manifest.json', source_digest)
-    for c in source['conditions']:
-        name = f'initializations/{c["id"]}_grid_union.json'
-        gate = read_json(SOURCE/f'status/initial_{c["block"]}.json')
-        value = read_json(SOURCE/name)
-        if not gate['complete'] or value['manifest_sha256'] != source_digest:
-            raise ValueError('source initialization gate failed')
-        validate_population(value)
-        copy(SOURCE/name, name, gate['sha256'])
-    runtime = read_json(RUNTIME_SOURCE)
-    assets = [(Path(runtime['image_path']), runtime['image_sha256'])]
-    checkpoint = Path(runtime['checkpoint_path'])
-    assets += [(checkpoint/f['name'], f['sha256']) for f in runtime['checkpoint_files']]
-    stats = {}
-    for path, digest in assets:
-        if sha256(path) != digest:
-            raise ValueError(f'runtime asset differs: {path}')
-        stat = path.stat()
-        stats[str(path)] = dict(size=stat.st_size, mtime_ns=stat.st_mtime_ns, sha256=digest)
-    # Include all tokenizer/template configuration files as well as model weights.
-    for path in sorted(checkpoint.iterdir()):
-        if path.is_file() and str(path) not in stats:
-            stat = path.stat()
-            stats[str(path)] = dict(size=stat.st_size, mtime_ns=stat.st_mtime_ns, sha256=sha256(path))
-    runtime.update(assets=stats, dtype='bfloat16', max_model_len=32768,
-                   max_num_seqs=4, gpu_memory_utilization=.85)
+    inputs = materialize('alarm', root)
+    source_manifest_hashes = set()
+    for condition in original.conditions():
+        population = read_json(root/f'initializations/{condition["id"]}_grid_union.json')
+        validate_population(population)
+        source_manifest_hashes.add(population['manifest_sha256'])
+    if len(source_manifest_hashes) != 1:
+        raise ValueError('packaged ALARM initializations do not share one source manifest')
+    source_manifest_sha256 = source_manifest_hashes.pop()
+    if read_json(root/'prompts.json') != original.templates():
+        raise ValueError('packaged ALARM prompts differ from the implementation')
+    runtime = protocol()['local_model']
     write_json(root/'inputs/runtime.json', runtime)
     inputs['inputs/runtime.json'] = sha256(root/'inputs/runtime.json')
-    paths = [Path(__file__), Path(transport.__file__), Path(recovery.__file__),
-             Path(__file__).with_name('alarm_claim_pools_local_report.py'),
-             ROOT/'code/figures/alarm_claim_pool_efficiency_local.py',
-             ROOT/'code/tests/unit/experiments/test_alarm_claim_pools_local.py', SCRIPT, GPU_SCRIPT]
-    implementation = dict(source['implementation'])
-    implementation.update({str(p.relative_to(ROOT)):sha256(p) for p in paths})
-    write_json(root/'manifest.json', dict(study=STUDY, version=1,
-        tasks=tasks(), conditions=source['conditions'], configuration=original.configuration(),
+    paths = [Path(__file__), Path(transport.__file__), Path(recovery.__file__), Path(original.__file__),
+             Path(__file__).with_name('alarm_claim_pools_local_report.py')]
+    implementation = {str(p.resolve().relative_to(CODE_ROOT.resolve())):sha256(p) for p in paths}
+    write_json(root/'manifest.json', dict(study=STUDY, version=2,
+        tasks=tasks(), conditions=original.conditions(), configuration=original.configuration(),
         settings=settings(), runtime=runtime, runtime_fingerprint=inputs['inputs/runtime.json'],
-        backend='local-vllm', source_manifest_sha256=source_digest,
-        source_experiment=str(SOURCE), expected_outcomes=3330, trajectories=60, checkpoints=240,
+        backend='local-vllm', input_bundle=protocol()['bundles']['alarm'],
+        source_manifest_sha256=source_manifest_sha256,
+        expected_outcomes=3330, trajectories=60, checkpoints=240,
         concurrency=4, actual_api_spending_usd=0., inputs=inputs, implementation=implementation,
-        paper_update=False, shared_initialization_bytes=True, parsing_policy=recovery.POLICY))
+        shared_initialization_bytes=True, parsing_policy=recovery.POLICY))
     write_json(root/'status.json', dict(stage='prepared', expected_outcomes=3330))
     return verify(root)
 
@@ -204,19 +168,14 @@ def validate_recovery(root):
 
 
 def runtime_check(root):
-    m = verify(root)
-    for name, value in m['runtime']['assets'].items():
-        stat = Path(name).stat()
-        if stat.st_size != value['size'] or stat.st_mtime_ns != value['mtime_ns']:
-            raise ValueError(f'runtime asset changed since full hash verification: {name}')
-    return m
+    return verify(root)
 
 
 async def collect(root):
     m = runtime_check(root)
     base_url = os.environ['ALARM_LOCAL_BASE_URL']
     db = ResponseCache(root/'cache/responses.sqlite3')
-    deadline = time.monotonic()+max(0.,float(os.environ['ALARM_LOCAL_DEADLINE'])-time.time())
+    deadline = time.monotonic()+max(0.,float(os.environ.get('ALARM_LOCAL_DEADLINE', time.time()+14400))-time.time())
     chat = transport.LocalChat(db, m, base_url, deadline=deadline)
     signal.signal(signal.SIGUSR1, lambda *_: setattr(chat, 'stopped', True))
     done, begun, stop = {}, time.monotonic(), asyncio.Event()

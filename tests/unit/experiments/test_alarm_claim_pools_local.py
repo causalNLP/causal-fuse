@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from cd_llm.experiments import alarm_claim_pools_local as study
 from cd_llm.experiments import alarm_claim_pools_local_transport as transport
+from cd_llm.experiments.common.reproduction_inputs import materialize
 
 
 class Client:
@@ -39,7 +40,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.path=Path(self.temp.name)/'responses.sqlite3'
         self.db=study.ResponseCache(self.path)
         self.m=dict(settings=study.settings(),runtime=dict(model_revision='revision'),runtime_fingerprint='runtime')
-        self.inputs=study.prompts.load_inputs(study.SOURCE)
+        self.input_root=Path(self.temp.name)/'inputs'
+        materialize('alarm',self.input_root)
+        self.inputs=study.prompts.load_inputs(self.input_root)
         self.query=next(q for q in study.dag_query_pool(37,study.GROUPS['all']) if q.kind=='ancestry')
 
     def tearDown(self):

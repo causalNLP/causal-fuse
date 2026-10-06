@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import argparse
 import itertools
 import math
 import sys
@@ -10,13 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "code" / "src"))
+CODE_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = CODE_ROOT.parent
+sys.path.insert(0, str(CODE_ROOT / "src"))
 
 from cd_llm.metrics.units import read_metric_csv  # noqa: E402
 
 
-RESULTS = ROOT / "results"
 GROUPS = {"group_i": "local", "group_ii": "ancestral", "all": "all"}
 FIELDS = (
     "dataset",
@@ -64,8 +65,7 @@ def validate(rows: list[dict], expected: set[tuple], key_fields: tuple[str, ...]
         raise ValueError(f"RQ2 conditions differ: missing={expected - set(keys)}, extra={set(keys) - expected}")
 
 
-def synthetic_rows() -> list[dict]:
-    path = RESULTS / "20260917T004634Z" / "synthetic_pc_grid_ablation" / "summary.csv"
+def synthetic_rows(path: Path) -> list[dict]:
     source = read_metric_csv(path, node_count=20, legacy_normalized=True)
     rows = [make_row(row, dataset="synthetic", model="simulated expert",
                      confidence_strategy="simulated", expert_accuracy=row["accuracy"],
@@ -103,18 +103,23 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--synthetic", type=Path, required=True)
+    parser.add_argument("--neuropathic", type=Path, required=True)
+    parser.add_argument("--alarm", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args()
     datasets = {
-        "synthetic.csv": synthetic_rows(),
+        "synthetic.csv": synthetic_rows(args.synthetic),
         "neuropathic_pain.csv": clinical_rows(
-            RESULTS / "20260919T005552Z" / "neuropathic_performance_cost" / "summary.csv",
+            args.neuropathic,
             dataset="neuropathic_pain", node_count=20, method_filter="SMC-Active"),
         "alarm.csv": clinical_rows(
-            RESULTS / "20260922T142041Z" / "alarm_claim_pools_consistency" / "combined_summary.csv",
+            args.alarm,
             dataset="alarm", node_count=37),
     }
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = RESULTS / stamp / "rq2_figure_data"
-    output.mkdir(parents=True, exist_ok=False)
+    output = args.output_dir
+    output.mkdir(parents=True, exist_ok=True)
     for filename, rows in datasets.items():
         write_csv(output / filename, rows)
         print(f"{output / filename}: {len(rows)} rows")

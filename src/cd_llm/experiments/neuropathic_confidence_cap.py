@@ -7,6 +7,7 @@ from dataclasses import asdict, replace
 import fcntl
 from itertools import combinations
 import math
+from pathlib import Path
 import shutil
 
 import numpy as np
@@ -21,10 +22,9 @@ from cd_llm.experiments.neuropathic_active_interpretation import graph
 from cd_llm.experiments.neuropathic_active_interpretation_report import interval
 from cd_llm.methods.active_query import ClaimQuery, dag_query_pool, query_values
 from cd_llm.methods.llm_claim_confidence import confidence_metrics
-from cd_llm.paths import WORKSPACE_ROOT
+from cd_llm.paths import CODE_ROOT, WORKSPACE_ROOT
 
 STUDY = "neuropathic_confidence_cap"
-SOURCE = WORKSPACE_ROOT / "results/20260918T003643Z/neuropathic_new_prompt_smc"
 CAP = 0.8
 BUDGETS = baseline.BUDGETS
 CONTRAST_METRICS = (*original.METRICS, "accuracy", "raw_brier", "effective_brier", "raw_ece", "effective_ece", "coverage")
@@ -63,59 +63,58 @@ def verify(root):
         if sha256(root / name) != digest:
             raise ValueError(f"frozen input changed: {name}")
     for name, digest in manifest["implementation"].items():
-        if sha256(WORKSPACE_ROOT / name) != digest:
+        if sha256(CODE_ROOT / name) != digest:
             raise ValueError(f"frozen implementation changed: {name}")
     return manifest
 
 
-def prepare(root):
+def prepare(root, source):
     if (root / "manifest.json").exists():
         return verify(root)
-    source = cache.verify(SOURCE)
-    cache.require_cache(SOURCE)
-    completed, audit = read_json(SOURCE / "completion.json"), read_json(SOURCE / "audit.json")
+    source_manifest = cache.verify(source)
+    cache.require_cache(source)
+    completed, audit = read_json(source / "completion.json"), read_json(source / "audit.json")
     if (not completed["complete"] or not completed["audit_passed"]
-        or sha256(SOURCE / "manifest.json") != completed["manifest_sha256"]
-        or sha256(SOURCE / "audit.json") != completed["audit_sha256"]):
+        or sha256(source / "manifest.json") != completed["manifest_sha256"]
+        or sha256(source / "audit.json") != completed["audit_sha256"]):
         raise ValueError("baseline completion audit differs")
     for name, digest in completed["artifacts"].items():
-        if sha256(SOURCE / name) != digest:
+        if sha256(source / name) != digest:
             raise ValueError(f"baseline artifact changed: {name}")
     inputs = {}
     def copy(name, target=None, expected=None):
         target = target or name
-        expected = expected or sha256(SOURCE / name)
-        if sha256(SOURCE / name) != expected:
+        expected = expected or sha256(source / name)
+        if sha256(source / name) != expected:
             raise ValueError(f"baseline input changed: {name}")
         destination = root / target
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(SOURCE / name, destination)
+        shutil.copyfile(source / name, destination)
         if sha256(destination) != expected:
             raise ValueError("copied input differs")
         inputs[target] = expected
-    for name, digest in source["inputs"].items():
+    for name, digest in source_manifest["inputs"].items():
         if name.startswith(("inputs/", "initializations/", "evaluation/")) or name == "prompts.json":
             copy(name, expected=digest)
-    gate = read_json(SOURCE / "cache_audit.json")
+    gate = read_json(source / "cache_audit.json")
     copy("responses.json", expected=gate["artifacts"]["responses.json"])
     copy("cache_audit.json")
     for name in ("manifest.json", "audit.json", "completion.json", "summary.json"):
         copy(name, "baseline/" + name)
-    for task in source["tasks"]:
+    for task in source_manifest["tasks"]:
         name = f"records/{task['id']}.json"
         copy(name, "baseline/" + name, audit["records"][task["id"]])
-    names = set(source["implementation"])
-    names.update(("code/src/cd_llm/experiments/neuropathic_confidence_cap.py",
-                  "code/scripts/submit_neuropathic_confidence_cap.py",
-                  "sbatch/neuropathic_confidence_cap.sbatch"))
-    manifest = dict(study=STUDY, version=1, source=str(SOURCE),
-        source_manifest_sha256=sha256(SOURCE / "manifest.json"), tasks=original.tasks(),
+    names = set(source_manifest["implementation"])
+    current = str(Path(__file__).resolve().relative_to(CODE_ROOT.resolve()))
+    names.add(current)
+    manifest = dict(study=STUDY, version=2, source=str(source),
+        source_manifest_sha256=sha256(source / "manifest.json"), tasks=original.tasks(),
         budgets=list(BUDGETS), answer_confidence_cap=CAP, baseline_evidence_cap=0.99,
         acquisition_confidence=0.9, engine_soft_confidence_cap=0.99,
-        configuration=dict(source["configuration"], answer_confidence_cap=CAP,
+        configuration=dict(source_manifest["configuration"], answer_confidence_cap=CAP,
             selection_confidence=0.9, api_requests=0,
             cap_implementation="clip provider confidence before weighting and MH; preserve raw confidence in audit"),
-        inputs=inputs, implementation={name: sha256(WORKSPACE_ROOT / name) for name in sorted(names)})
+        inputs=inputs, implementation={name: sha256(CODE_ROOT / name) for name in sorted(names)})
     write_json(root / "manifest.json", manifest)
     write_json(root / "status.json", dict(stage="prepared", trajectories=120, checkpoints=480, new_api_requests=0))
     print(f"Prepared {root}: 120 capped trajectories and 480 checkpoints, no API requests.", flush=True)
@@ -271,8 +270,8 @@ def _report(root):
         record = read_json(path)
         validate_record(root, record, task, manifest, experts)
         hashes[task["id"]] = sha256(path)
-        archived = read_json(root / f"baseline/records/{task['id']}.json")
-        for cap, full in ((CAP, record), (0.99, archived)):
+        uncapped_record = read_json(root / f"baseline/records/{task['id']}.json")
+        for cap, full in ((CAP, record), (0.99, uncapped_record)):
             for budget in BUDGETS:
                 metrics, raw, effective = metrics_for(baseline.prefix_record(full, budget), truth)
                 row = dict(evidence_cap=cap, budget=budget, sample_size=task["sample_size"],
@@ -296,7 +295,7 @@ def _report(root):
         row.update(calibration(*pooled[key]))
         row.update(coverage=row["answered"] / row["attempted"], elapsed_seconds=sum(r["elapsed_seconds"] for r in members))
         summaries.append(row)
-    # Guard comparison against accidental changes in archived metric definitions.
+    # Guard comparison against accidental changes in the source-run metric definitions.
     source_payload = read_json(root / "baseline/summary.json")
     source_rows = convert_metrics(source_payload["summaries"], 190,
                                   source_scale=source_payload.get("metric_scale", "normalized"))
@@ -343,22 +342,27 @@ def _report(root):
     print(f"Completed report: {root / 'report.md'}", flush=True)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("prepare", "run-block", "validate-pilot", "report"))
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--block", type=int)
-    args = parser.parse_args()
+    parser.add_argument("--source-root", type=Path)
+    args = parser.parse_args(argv)
     root = WORKSPACE_ROOT / "results" / run_id(args.run_id) / STUDY
+    source = args.source_root or root.parent / cache.STUDY
     if args.stage == "run-block":
         if args.block is None:
             parser.error("run-block requires --block")
         run_block(root, args.block)
     else:
-        {"prepare": prepare, "validate-pilot": validate_pilot, "report": report}[args.stage](root)
+        if args.stage == "prepare":
+            prepare(root, source)
+        else:
+            {"validate-pilot": validate_pilot, "report": report}[args.stage](root)
 
 
-# Retain the archived protocol checks, adapting the pooled confidence to the answer cap.
+# Retain the source protocol checks while adapting pooled confidence to the answer cap.
 def validate_core(record, task, manifest_digest, population_digest):
     if record["task"] != task or record["manifest_sha256"] != manifest_digest:
         raise ValueError("trajectory identity differs")
